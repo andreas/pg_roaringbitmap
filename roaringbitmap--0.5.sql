@@ -49,6 +49,12 @@ CREATE CAST (roaringbitmap AS bytea) WITHOUT FUNCTION;
 
 CREATE CAST (bytea AS roaringbitmap) WITH FUNCTION roaringbitmap(bytea);
 
+-- Native-format deserialization helper
+CREATE OR REPLACE FUNCTION rb_deserialize_native(bytea)
+  RETURNS roaringbitmap
+  AS 'MODULE_PATHNAME','rb_deserialize_native'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
 --
 -- Operator Functions
 --

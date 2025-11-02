@@ -27,6 +27,12 @@ select  '{}'::roaringbitmap;
 select '\x3a30000000000000'::roaringbitmap;
 select '\x3a300000030000000000000008000000ffff01002000000022000000240000000200237afcffffff'::roaringbitmap;
 
+-- Test native deserialization (CROARING native format via roaring_bitmap_deserialize_safe)
+select rb_deserialize_native('\x0100000000'::bytea);
+select rb_deserialize_native('\x010100000001000000'::bytea);
+select rb_deserialize_native('\x010200000001000000e8030000'::bytea);
+select rb_deserialize_native('\x023a30000000000000'::bytea);
+
 -- Exception
 select  ''::roaringbitmap;
 select  '{'::roaringbitmap;

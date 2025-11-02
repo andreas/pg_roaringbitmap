@@ -85,6 +85,31 @@ select '\x3a300000030000000000000008000000ffff0100200000002200000024000000020023
  {2,555555,-4,-1}
 (1 row)
 
+-- Test native deserialization (CROARING native format via roaring_bitmap_deserialize_safe)
+select rb_deserialize_native('\x0100000000'::bytea);
+ rb_deserialize_native 
+-----------------------
+ {}
+(1 row)
+
+select rb_deserialize_native('\x010100000001000000'::bytea);
+ rb_deserialize_native 
+-----------------------
+ {1}
+(1 row)
+
+select rb_deserialize_native('\x010200000001000000e8030000'::bytea);
+ rb_deserialize_native 
+-----------------------
+ {1,1000}
+(1 row)
+
+select rb_deserialize_native('\x023a30000000000000'::bytea);
+ rb_deserialize_native 
+-----------------------
+ {}
+(1 row)
+
 -- Exception
 select  ''::roaringbitmap;
 ERROR:  malformed bitmap literal

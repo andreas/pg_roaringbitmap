@@ -118,6 +118,33 @@ rb_from_bytea(PG_FUNCTION_ARGS) {
 }
 
 
+// rb_deserialize_native
+Datum rb_deserialize_native(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(rb_deserialize_native);
+
+Datum
+rb_deserialize_native(PG_FUNCTION_ARGS) {
+    bytea *input = PG_GETARG_BYTEA_P(0);
+    roaring_bitmap_t *bitmap;
+    size_t portable_size;
+    bytea *result;
+
+    bitmap = roaring_bitmap_deserialize_safe(VARDATA(input), VARSIZE(input) - VARHDRSZ);
+    if (!bitmap)
+        ereport(ERROR,
+                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                 errmsg("bitmap format is error")));
+
+    portable_size = roaring_bitmap_portable_size_in_bytes(bitmap);
+    result = (bytea *) palloc(VARHDRSZ + portable_size);
+    roaring_bitmap_portable_serialize(bitmap, VARDATA(result));
+    roaring_bitmap_free(bitmap);
+
+    SET_VARSIZE(result, VARHDRSZ + portable_size);
+    PG_RETURN_BYTEA_P(result);
+}
+
+
 //roaringbitmap_in
 Datum roaringbitmap_in(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(roaringbitmap_in);
