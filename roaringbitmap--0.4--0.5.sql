@@ -35,3 +35,9 @@ CREATE AGGREGATE rb_xor_cardinality_agg(roaringbitmap)(
   PARALLEL = SAFE
 );
 
+-- New function introduced in 0.5
+CREATE OR REPLACE FUNCTION rb_kmerge(bitmaps roaringbitmap[])
+  RETURNS TABLE (element int, sources int[])
+  AS 'MODULE_PATHNAME', 'rb_kmerge'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+

@@ -1,4 +1,5 @@
 #include "roaringbitmap.h"
+#include "utils/lsyscache.h"
 
 /* Created by ZEROMAX on 2017/3/20.*/
 
@@ -90,6 +91,297 @@ ArrayContainsNulls(ArrayType *array) {
 }
 
 
+
+// kmerge SRF
+PG_FUNCTION_INFO_V1(rb_kmerge);
+Datum rb_kmerge(PG_FUNCTION_ARGS);
+
+typedef struct {
+    uint32 value;
+    bool has_value;
+} OptU32;
+
+typedef struct {
+    int element_idx; /* 0-based index of iterator */
+    OptU32 value;
+} KMergNode;
+
+typedef struct {
+    int n; /* number of iterators */
+    roaring_uint32_iterator_t **iters;
+    /* tournament tree internals */
+    OptU32 *value_losertree; /* size nodecount */
+    int *idx_losertree;      /* size nodecount */
+    size_t nodecount;
+    KMergNode winner;
+    TupleDesc tupdesc; /* cached result tuple descriptor */
+} KMergeState;
+
+static inline bool kmerge_cond_opt_greater(const OptU32 *candidate, const OptU32 *tree)
+{
+    if (candidate->has_value && tree->has_value)
+        return candidate->value > tree->value;
+    if (!candidate->has_value && !tree->has_value)
+        return false;
+    if (!tree->has_value)
+        return false;
+    if (!candidate->has_value)
+        return true;
+    return false;
+}
+
+static KMergNode kmerge_rebuild_loser_tree(size_t idx,
+                                           OptU32 *value_tree,
+                                           int *idx_tree,
+                                           size_t total_len)
+{
+    size_t left_idx = 2 * idx + 1;
+    size_t right_idx = 2 * idx + 2;
+
+    if (right_idx >= total_len) {
+        /* leaf */
+        KMergNode leaf;
+        leaf.value = value_tree[idx];
+        leaf.element_idx = idx_tree[idx];
+        return leaf;
+    }
+
+    KMergNode left = kmerge_rebuild_loser_tree(left_idx, value_tree, idx_tree, total_len);
+    KMergNode right = kmerge_rebuild_loser_tree(right_idx, value_tree, idx_tree, total_len);
+
+    if (!left.value.has_value && !right.value.has_value) {
+        idx_tree[idx] = right.element_idx;
+        value_tree[idx] = right.value;
+        return left;
+    } else if (!left.value.has_value && right.value.has_value) {
+        idx_tree[idx] = left.element_idx;
+        value_tree[idx] = left.value;
+        return right;
+    } else if (left.value.has_value && !right.value.has_value) {
+        idx_tree[idx] = right.element_idx;
+        value_tree[idx] = right.value;
+        return left;
+    } else {
+        if (left.value.value < right.value.value) {
+            idx_tree[idx] = right.element_idx;
+            value_tree[idx] = right.value;
+            return left;
+        } else {
+            idx_tree[idx] = left.element_idx;
+            value_tree[idx] = left.value;
+            return right;
+        }
+    }
+}
+
+static inline void kmerge_pop_and_push(KMergeState *state)
+{
+    if (!state->winner.value.has_value)
+        return;
+
+    roaring_uint32_iterator_t *it = state->iters[state->winner.element_idx];
+    /* advance iterator corresponding to current winner */
+    roaring_uint32_iterator_advance(it);
+
+    int candidate_idx = state->winner.element_idx;
+    OptU32 candidate_value;
+    candidate_value.has_value = it->has_value;
+    if (candidate_value.has_value)
+        candidate_value.value = it->current_value;
+
+    size_t current_idx = state->nodecount + (size_t)candidate_idx;
+    while (current_idx >= 1) {
+        current_idx = (current_idx - 1) >> 1;
+
+        OptU32 tree_value = state->value_losertree[current_idx];
+        int tree_idx = state->idx_losertree[current_idx];
+
+        bool cond = kmerge_cond_opt_greater(&candidate_value, &tree_value);
+
+        int new_candidate_idx, new_tree_idx;
+        OptU32 new_candidate_value, new_tree_value;
+
+        if (cond) {
+            new_candidate_idx = tree_idx;
+            new_tree_idx = candidate_idx;
+            new_candidate_value = tree_value;
+            new_tree_value = candidate_value;
+        } else {
+            new_candidate_idx = candidate_idx;
+            new_tree_idx = tree_idx;
+            new_candidate_value = candidate_value;
+            new_tree_value = tree_value;
+        }
+
+        state->idx_losertree[current_idx] = new_tree_idx;
+        state->value_losertree[current_idx] = new_tree_value;
+        candidate_idx = new_candidate_idx;
+        candidate_value = new_candidate_value;
+    }
+
+    state->winner.element_idx = candidate_idx;
+    state->winner.value = candidate_value;
+}
+
+static int int32_asc_cmp(const void *a, const void *b)
+{
+    int32 aa = *(const int32 *)a;
+    int32 bb = *(const int32 *)b;
+    if (aa < bb) return -1;
+    if (aa > bb) return 1;
+    return 0;
+}
+
+Datum
+rb_kmerge(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    MemoryContext oldcontext;
+
+    if (SRF_IS_FIRSTCALL()) {
+        ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
+        funcctx = SRF_FIRSTCALL_INIT();
+
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        int16 elmlen;
+        bool elmbyval;
+        char elmalign;
+        Oid elmtype = ARR_ELEMTYPE(arr);
+        get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+
+        Datum *elem_values;
+        bool *elem_nulls;
+        int nelems;
+        deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
+                          &elem_values, &elem_nulls, &nelems);
+
+        int count = 0;
+        for (int i = 0; i < nelems; i++) {
+            if (!elem_nulls[i]) count++;
+        }
+
+        KMergeState *state = (KMergeState *) palloc0(sizeof(KMergeState));
+        state->n = count;
+        state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
+
+        /* Prepare leaves */
+        size_t elementcount = (size_t) count;
+        if (elementcount == 0) {
+            state->nodecount = 0;
+            state->winner.element_idx = -1;
+            state->winner.value.has_value = false;
+        } else {
+            size_t nodecount = elementcount - 1;
+            /* temp arrays: internal nodes + leaves */
+            OptU32 *value_tree = (OptU32 *) palloc0(sizeof(OptU32) * (nodecount + elementcount));
+            int *idx_tree = (int *) palloc0(sizeof(int) * (nodecount + elementcount));
+
+            int out_idx = 0;
+            for (int i = 0; i < nelems; i++) {
+                if (elem_nulls[i]) continue;
+                bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
+                roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+                if (!rb)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                             errmsg("bitmap format is error")));
+                roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+                state->iters[out_idx] = it;
+                idx_tree[nodecount + out_idx] = out_idx;
+                if (it->has_value) {
+                    value_tree[nodecount + out_idx].has_value = true;
+                    value_tree[nodecount + out_idx].value = it->current_value;
+                } else {
+                    value_tree[nodecount + out_idx].has_value = false;
+                }
+                out_idx++;
+            }
+
+            /* initialize internal nodes */
+            for (size_t i = 0; i < nodecount; i++) {
+                value_tree[i].has_value = false;
+                idx_tree[i] = -1;
+            }
+
+            KMergNode winner = kmerge_rebuild_loser_tree(0, value_tree, idx_tree, nodecount + elementcount);
+
+            /* store losertree (internal nodes only) */
+            state->value_losertree = (OptU32 *) palloc(sizeof(OptU32) * nodecount);
+            state->idx_losertree = (int *) palloc(sizeof(int) * nodecount);
+            for (size_t i = 0; i < nodecount; i++) {
+                state->value_losertree[i] = value_tree[i];
+                state->idx_losertree[i] = idx_tree[i];
+            }
+            state->nodecount = nodecount;
+            state->winner = winner;
+
+            pfree(value_tree);
+            pfree(idx_tree);
+        }
+
+        /* set up result tuple descriptor */
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("return type must be a row type")));
+        BlessTupleDesc(tupdesc);
+
+        state->tupdesc = tupdesc;
+        funcctx->user_fctx = state;
+
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    KMergeState *state = (KMergeState *) funcctx->user_fctx;
+
+    if (!state->winner.value.has_value) {
+        /* cleanup */
+        for (int i = 0; i < state->n; i++) {
+            if (state->iters[i])
+                roaring_uint32_iterator_free(state->iters[i]);
+        }
+        if (state->iters) pfree(state->iters);
+        if (state->value_losertree) pfree(state->value_losertree);
+        if (state->idx_losertree) pfree(state->idx_losertree);
+        pfree(state);
+        SRF_RETURN_DONE(funcctx);
+    }
+
+    /* collect all sources for the current minimum value */
+    uint32 current_val_u = state->winner.value.value;
+    int32 current_val = (int32) current_val_u;
+
+    /* collect indices (0-based) */
+    int32 *sources = (int32 *) palloc(sizeof(int32) * Max(state->n, 1));
+    int nsources = 0;
+
+    do {
+        /* record source (convert to 1-based later) */
+        sources[nsources++] = (int32) state->winner.element_idx;
+        /* advance tree */
+        kmerge_pop_and_push(state);
+    } while (state->winner.value.has_value && state->winner.value.value == current_val_u);
+
+    /* sort and convert to 1-based */
+    qsort(sources, nsources, sizeof(int32), int32_asc_cmp);
+    for (int i = 0; i < nsources; i++) sources[i] += 1;
+
+    Datum vals[2];
+    bool nulls[2] = {false, false};
+
+    vals[0] = Int32GetDatum(current_val);
+
+    Datum *src_datums = (Datum *) palloc(sizeof(Datum) * nsources);
+    for (int i = 0; i < nsources; i++) src_datums[i] = Int32GetDatum(sources[i]);
+    ArrayType *src_array = construct_array(src_datums, nsources, INT4OID, sizeof(int32), true, 'i');
+    vals[1] = PointerGetDatum(src_array);
+
+    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+}
 
 //rb_from_bytea
 Datum rb_from_bytea(PG_FUNCTION_ARGS);
