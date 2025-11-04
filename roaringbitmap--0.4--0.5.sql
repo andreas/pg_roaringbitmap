@@ -41,3 +41,8 @@ CREATE OR REPLACE FUNCTION rb_kmerge(bitmaps roaringbitmap[])
   AS 'MODULE_PATHNAME', 'rb_kmerge'
   LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
+CREATE OR REPLACE FUNCTION rb_kmerge_avg(bitmaps roaringbitmap[], labels int[])
+  RETURNS SETOF float8
+  AS 'MODULE_PATHNAME', 'rb_kmerge_avg'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+

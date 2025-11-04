@@ -92,9 +92,11 @@ ArrayContainsNulls(ArrayType *array) {
 
 
 
-// kmerge SRF
+// kmerge SRFs
 PG_FUNCTION_INFO_V1(rb_kmerge);
 Datum rb_kmerge(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(rb_kmerge_avg);
+Datum rb_kmerge_avg(PG_FUNCTION_ARGS);
 
 typedef struct {
     uint32 value;
@@ -115,6 +117,7 @@ typedef struct {
     size_t nodecount;
     KMergNode winner;
     TupleDesc tupdesc; /* cached result tuple descriptor */
+    int32 *labels; /* optional labels per iterator (for avg variant) */
 } KMergeState;
 
 static inline bool kmerge_cond_opt_greater(const OptU32 *candidate, const OptU32 *tree)
@@ -264,6 +267,7 @@ rb_kmerge(PG_FUNCTION_ARGS)
         KMergeState *state = (KMergeState *) palloc0(sizeof(KMergeState));
         state->n = count;
         state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
+        state->labels = NULL;
 
         /* Prepare leaves */
         size_t elementcount = (size_t) count;
@@ -381,6 +385,147 @@ rb_kmerge(PG_FUNCTION_ARGS)
 
     HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
     SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+}
+
+Datum
+rb_kmerge_avg(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    MemoryContext oldcontext;
+
+    if (SRF_IS_FIRSTCALL()) {
+        ArrayType *arr_bitmaps = PG_GETARG_ARRAYTYPE_P(0);
+        ArrayType *arr_labels = PG_GETARG_ARRAYTYPE_P(1);
+        funcctx = SRF_FIRSTCALL_INIT();
+
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        int16 blen; bool bbyval; char balign;
+        Oid btype = ARR_ELEMTYPE(arr_bitmaps);
+        get_typlenbyvalalign(btype, &blen, &bbyval, &balign);
+
+        int16 llen; bool lbyval; char lalign;
+        Oid ltype = ARR_ELEMTYPE(arr_labels);
+        get_typlenbyvalalign(ltype, &llen, &lbyval, &lalign);
+
+        Datum *bvals; bool *bnulls; int bnelems;
+        deconstruct_array(arr_bitmaps, btype, blen, bbyval, balign,
+                          &bvals, &bnulls, &bnelems);
+
+        Datum *lvals; bool *lnulls; int lnelems;
+        deconstruct_array(arr_labels, ltype, llen, lbyval, lalign,
+                          &lvals, &lnulls, &lnelems);
+
+        if (lnelems != bnelems)
+            ereport(ERROR,
+                    (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                     errmsg("labels array length must match bitmaps array length")));
+
+        int count = 0;
+        for (int i = 0; i < bnelems; i++) {
+            if (!bnulls[i]) count++;
+        }
+
+        KMergeState *state = (KMergeState *) palloc0(sizeof(KMergeState));
+        state->n = count;
+        state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
+        state->labels = (int32 *) palloc0(sizeof(int32) * Max(count, 1));
+
+        size_t elementcount = (size_t) count;
+        if (elementcount == 0) {
+            state->nodecount = 0;
+            state->winner.element_idx = -1;
+            state->winner.value.has_value = false;
+        } else {
+            size_t nodecount = elementcount - 1;
+            OptU32 *value_tree = (OptU32 *) palloc0(sizeof(OptU32) * (nodecount + elementcount));
+            int *idx_tree = (int *) palloc0(sizeof(int) * (nodecount + elementcount));
+
+            int out_idx = 0;
+            for (int i = 0; i < bnelems; i++) {
+                if (bnulls[i]) continue;
+
+                if (lnulls && lnulls[i])
+                    ereport(ERROR,
+                            (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                             errmsg("label value must not be NULL when corresponding bitmap is non-NULL")));
+
+                bytea *data = (bytea *) DatumGetPointer(bvals[i]);
+                roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+                if (!rb)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                             errmsg("bitmap format is error")));
+
+                roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+                state->iters[out_idx] = it;
+                state->labels[out_idx] = DatumGetInt32(lvals[i]);
+
+                idx_tree[nodecount + out_idx] = out_idx;
+                if (it->has_value) {
+                    value_tree[nodecount + out_idx].has_value = true;
+                    value_tree[nodecount + out_idx].value = it->current_value;
+                } else {
+                    value_tree[nodecount + out_idx].has_value = false;
+                }
+                out_idx++;
+            }
+
+            for (size_t i = 0; i < nodecount; i++) {
+                value_tree[i].has_value = false;
+                idx_tree[i] = -1;
+            }
+
+            KMergNode winner = kmerge_rebuild_loser_tree(0, value_tree, idx_tree, nodecount + elementcount);
+
+            state->value_losertree = (OptU32 *) palloc(sizeof(OptU32) * nodecount);
+            state->idx_losertree = (int *) palloc(sizeof(int) * nodecount);
+            for (size_t i = 0; i < nodecount; i++) {
+                state->value_losertree[i] = value_tree[i];
+                state->idx_losertree[i] = idx_tree[i];
+            }
+            state->nodecount = nodecount;
+            state->winner = winner;
+
+            pfree(value_tree);
+            pfree(idx_tree);
+        }
+
+        funcctx->user_fctx = state;
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    KMergeState *state = (KMergeState *) funcctx->user_fctx;
+
+    if (!state->winner.value.has_value) {
+        for (int i = 0; i < state->n; i++) {
+            if (state->iters[i])
+                roaring_uint32_iterator_free(state->iters[i]);
+        }
+        if (state->iters) pfree(state->iters);
+        if (state->labels) pfree(state->labels);
+        if (state->value_losertree) pfree(state->value_losertree);
+        if (state->idx_losertree) pfree(state->idx_losertree);
+        pfree(state);
+        SRF_RETURN_DONE(funcctx);
+    }
+
+    uint32 current_val_u = state->winner.value.value;
+
+    double sum = 0.0;
+    int cnt = 0;
+
+    do {
+        int src = state->winner.element_idx;
+        sum += (double) state->labels[src];
+        cnt++;
+        kmerge_pop_and_push(state);
+    } while (state->winner.value.has_value && state->winner.value.value == current_val_u);
+
+    double avg = cnt > 0 ? (sum / (double) cnt) : 0.0;
+
+    SRF_RETURN_NEXT(funcctx, Float8GetDatum(avg));
 }
 
 //rb_from_bytea

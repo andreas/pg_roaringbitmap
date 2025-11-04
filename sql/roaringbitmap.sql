@@ -627,3 +627,9 @@ select rb_kmerge(ARRAY[
   rb_build(ARRAY[10,5])
 ]);
 
+
+select rb_kmerge_avg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[1,2,3]);
