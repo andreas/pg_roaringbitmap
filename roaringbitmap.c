@@ -111,119 +111,39 @@ typedef struct {
 typedef struct {
     int n; /* number of iterators */
     roaring_uint32_iterator_t **iters;
-    /* tournament tree internals */
-    OptU32 *value_losertree; /* size nodecount */
-    int *idx_losertree;      /* size nodecount */
-    size_t nodecount;
-    KMergNode winner;
+    /* heap-based k-way merge */
+    KMergNode *heap; /* min-heap of active iterators by current value */
+    int heap_size;
     TupleDesc tupdesc; /* cached result tuple descriptor */
     int32 *labels; /* optional labels per iterator (for avg variant) */
 } KMergeState;
 
-static inline bool kmerge_cond_opt_greater(const OptU32 *candidate, const OptU32 *tree)
+/* kept for past loser-tree implementation; now unused */
+
+/* --- Min-heap helpers for k-way merge --- */
+static inline void heap_sift_down(KMergNode *heap, int size, int idx)
 {
-    if (candidate->has_value && tree->has_value)
-        return candidate->value > tree->value;
-    if (!candidate->has_value && !tree->has_value)
-        return false;
-    if (!tree->has_value)
-        return false;
-    if (!candidate->has_value)
-        return true;
-    return false;
-}
-
-static KMergNode kmerge_rebuild_loser_tree(size_t idx,
-                                           OptU32 *value_tree,
-                                           int *idx_tree,
-                                           size_t total_len)
-{
-    size_t left_idx = 2 * idx + 1;
-    size_t right_idx = 2 * idx + 2;
-
-    if (right_idx >= total_len) {
-        /* leaf */
-        KMergNode leaf;
-        leaf.value = value_tree[idx];
-        leaf.element_idx = idx_tree[idx];
-        return leaf;
-    }
-
-    KMergNode left = kmerge_rebuild_loser_tree(left_idx, value_tree, idx_tree, total_len);
-    KMergNode right = kmerge_rebuild_loser_tree(right_idx, value_tree, idx_tree, total_len);
-
-    if (!left.value.has_value && !right.value.has_value) {
-        idx_tree[idx] = right.element_idx;
-        value_tree[idx] = right.value;
-        return left;
-    } else if (!left.value.has_value && right.value.has_value) {
-        idx_tree[idx] = left.element_idx;
-        value_tree[idx] = left.value;
-        return right;
-    } else if (left.value.has_value && !right.value.has_value) {
-        idx_tree[idx] = right.element_idx;
-        value_tree[idx] = right.value;
-        return left;
-    } else {
-        if (left.value.value < right.value.value) {
-            idx_tree[idx] = right.element_idx;
-            value_tree[idx] = right.value;
-            return left;
-        } else {
-            idx_tree[idx] = left.element_idx;
-            value_tree[idx] = left.value;
-            return right;
-        }
+    for (;;) {
+        int left = (idx << 1) + 1;
+        if (left >= size) break;
+        int right = left + 1;
+        int smallest = left;
+        if (right < size && heap[right].value.value < heap[left].value.value)
+            smallest = right;
+        if (!(heap[smallest].value.value < heap[idx].value.value))
+            break;
+        KMergNode tmp = heap[idx];
+        heap[idx] = heap[smallest];
+        heap[smallest] = tmp;
+        idx = smallest;
     }
 }
 
-static inline void kmerge_pop_and_push(KMergeState *state)
+static inline void heap_heapify(KMergNode *heap, int size)
 {
-    if (!state->winner.value.has_value)
-        return;
-
-    roaring_uint32_iterator_t *it = state->iters[state->winner.element_idx];
-    /* advance iterator corresponding to current winner */
-    roaring_uint32_iterator_advance(it);
-
-    int candidate_idx = state->winner.element_idx;
-    OptU32 candidate_value;
-    candidate_value.has_value = it->has_value;
-    if (candidate_value.has_value)
-        candidate_value.value = it->current_value;
-
-    size_t current_idx = state->nodecount + (size_t)candidate_idx;
-    while (current_idx >= 1) {
-        current_idx = (current_idx - 1) >> 1;
-
-        OptU32 tree_value = state->value_losertree[current_idx];
-        int tree_idx = state->idx_losertree[current_idx];
-
-        bool cond = kmerge_cond_opt_greater(&candidate_value, &tree_value);
-
-        int new_candidate_idx, new_tree_idx;
-        OptU32 new_candidate_value, new_tree_value;
-
-        if (cond) {
-            new_candidate_idx = tree_idx;
-            new_tree_idx = candidate_idx;
-            new_candidate_value = tree_value;
-            new_tree_value = candidate_value;
-        } else {
-            new_candidate_idx = candidate_idx;
-            new_tree_idx = tree_idx;
-            new_candidate_value = candidate_value;
-            new_tree_value = tree_value;
-        }
-
-        state->idx_losertree[current_idx] = new_tree_idx;
-        state->value_losertree[current_idx] = new_tree_value;
-        candidate_idx = new_candidate_idx;
-        candidate_value = new_candidate_value;
+    for (int i = (size >> 1) - 1; i >= 0; i--) {
+        heap_sift_down(heap, size, i);
     }
-
-    state->winner.element_idx = candidate_idx;
-    state->winner.value = candidate_value;
 }
 
 static int int32_asc_cmp(const void *a, const void *b)
@@ -269,59 +189,31 @@ rb_kmerge(PG_FUNCTION_ARGS)
         state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
         state->labels = NULL;
 
-        /* Prepare leaves */
-        size_t elementcount = (size_t) count;
-        if (elementcount == 0) {
-            state->nodecount = 0;
-            state->winner.element_idx = -1;
-            state->winner.value.has_value = false;
-        } else {
-            size_t nodecount = elementcount - 1;
-            /* temp arrays: internal nodes + leaves */
-            OptU32 *value_tree = (OptU32 *) palloc0(sizeof(OptU32) * (nodecount + elementcount));
-            int *idx_tree = (int *) palloc0(sizeof(int) * (nodecount + elementcount));
-
-            int out_idx = 0;
-            for (int i = 0; i < nelems; i++) {
-                if (elem_nulls[i]) continue;
-                bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
-                roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
-                if (!rb)
-                    ereport(ERROR,
-                            (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                             errmsg("bitmap format is error")));
-                roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
-                state->iters[out_idx] = it;
-                idx_tree[nodecount + out_idx] = out_idx;
-                if (it->has_value) {
-                    value_tree[nodecount + out_idx].has_value = true;
-                    value_tree[nodecount + out_idx].value = it->current_value;
-                } else {
-                    value_tree[nodecount + out_idx].has_value = false;
-                }
-                out_idx++;
+        /* Build heap of active iterators */
+        state->heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
+        int heap_size = 0;
+        int out_idx = 0;
+        for (int i = 0; i < nelems; i++) {
+            if (elem_nulls[i]) continue;
+            bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
+            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+            if (!rb)
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("bitmap format is error")));
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            state->iters[out_idx] = it;
+            if (it->has_value) {
+                state->heap[heap_size].element_idx = out_idx;
+                state->heap[heap_size].value.has_value = true;
+                state->heap[heap_size].value.value = it->current_value;
+                heap_size++;
             }
-
-            /* initialize internal nodes */
-            for (size_t i = 0; i < nodecount; i++) {
-                value_tree[i].has_value = false;
-                idx_tree[i] = -1;
-            }
-
-            KMergNode winner = kmerge_rebuild_loser_tree(0, value_tree, idx_tree, nodecount + elementcount);
-
-            /* store losertree (internal nodes only) */
-            state->value_losertree = (OptU32 *) palloc(sizeof(OptU32) * nodecount);
-            state->idx_losertree = (int *) palloc(sizeof(int) * nodecount);
-            for (size_t i = 0; i < nodecount; i++) {
-                state->value_losertree[i] = value_tree[i];
-                state->idx_losertree[i] = idx_tree[i];
-            }
-            state->nodecount = nodecount;
-            state->winner = winner;
-
-            pfree(value_tree);
-            pfree(idx_tree);
+            out_idx++;
+        }
+        state->heap_size = heap_size;
+        if (heap_size > 1) {
+            heap_heapify(state->heap, heap_size);
         }
 
         /* set up result tuple descriptor */
@@ -341,21 +233,20 @@ rb_kmerge(PG_FUNCTION_ARGS)
     funcctx = SRF_PERCALL_SETUP();
     KMergeState *state = (KMergeState *) funcctx->user_fctx;
 
-    if (!state->winner.value.has_value) {
+    if (state->heap_size == 0) {
         /* cleanup */
         for (int i = 0; i < state->n; i++) {
             if (state->iters[i])
                 roaring_uint32_iterator_free(state->iters[i]);
         }
         if (state->iters) pfree(state->iters);
-        if (state->value_losertree) pfree(state->value_losertree);
-        if (state->idx_losertree) pfree(state->idx_losertree);
+        if (state->heap) pfree(state->heap);
         pfree(state);
         SRF_RETURN_DONE(funcctx);
     }
 
     /* collect all sources for the current minimum value */
-    uint32 current_val_u = state->winner.value.value;
+    uint32 current_val_u = state->heap[0].value.value;
     int32 current_val = (int32) current_val_u;
 
     /* collect indices (0-based) */
@@ -364,10 +255,22 @@ rb_kmerge(PG_FUNCTION_ARGS)
 
     do {
         /* record source (convert to 1-based later) */
-        sources[nsources++] = (int32) state->winner.element_idx;
-        /* advance tree */
-        kmerge_pop_and_push(state);
-    } while (state->winner.value.has_value && state->winner.value.value == current_val_u);
+        int src = state->heap[0].element_idx;
+        sources[nsources++] = (int32) src;
+        /* advance iterator at heap root and adjust heap */
+        roaring_uint32_iterator_t *it = state->iters[src];
+        roaring_uint32_iterator_advance(it);
+        if (it->has_value) {
+            state->heap[0].value.value = it->current_value;
+            heap_sift_down(state->heap, state->heap_size, 0);
+        } else {
+            /* remove root */
+            state->heap[0] = state->heap[state->heap_size - 1];
+            state->heap_size--;
+            if (state->heap_size > 0)
+                heap_sift_down(state->heap, state->heap_size, 0);
+        }
+    } while (state->heap_size > 0 && state->heap[0].value.value == current_val_u);
 
     /* sort and convert to 1-based */
     qsort(sources, nsources, sizeof(int32), int32_asc_cmp);
@@ -431,65 +334,39 @@ rb_kmerge_avg(PG_FUNCTION_ARGS)
         state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
         state->labels = (int32 *) palloc0(sizeof(int32) * Max(count, 1));
 
-        size_t elementcount = (size_t) count;
-        if (elementcount == 0) {
-            state->nodecount = 0;
-            state->winner.element_idx = -1;
-            state->winner.value.has_value = false;
-        } else {
-            size_t nodecount = elementcount - 1;
-            OptU32 *value_tree = (OptU32 *) palloc0(sizeof(OptU32) * (nodecount + elementcount));
-            int *idx_tree = (int *) palloc0(sizeof(int) * (nodecount + elementcount));
+        state->heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
+        int heap_size = 0;
+        int out_idx = 0;
+        for (int i = 0; i < bnelems; i++) {
+            if (bnulls[i]) continue;
 
-            int out_idx = 0;
-            for (int i = 0; i < bnelems; i++) {
-                if (bnulls[i]) continue;
+            if (lnulls && lnulls[i])
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("label value must not be NULL when corresponding bitmap is non-NULL")));
 
-                if (lnulls && lnulls[i])
-                    ereport(ERROR,
-                            (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                             errmsg("label value must not be NULL when corresponding bitmap is non-NULL")));
+            bytea *data = (bytea *) DatumGetPointer(bvals[i]);
+            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+            if (!rb)
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("bitmap format is error")));
 
-                bytea *data = (bytea *) DatumGetPointer(bvals[i]);
-                roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
-                if (!rb)
-                    ereport(ERROR,
-                            (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                             errmsg("bitmap format is error")));
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            state->iters[out_idx] = it;
+            state->labels[out_idx] = DatumGetInt32(lvals[i]);
 
-                roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
-                state->iters[out_idx] = it;
-                state->labels[out_idx] = DatumGetInt32(lvals[i]);
-
-                idx_tree[nodecount + out_idx] = out_idx;
-                if (it->has_value) {
-                    value_tree[nodecount + out_idx].has_value = true;
-                    value_tree[nodecount + out_idx].value = it->current_value;
-                } else {
-                    value_tree[nodecount + out_idx].has_value = false;
-                }
-                out_idx++;
+            if (it->has_value) {
+                state->heap[heap_size].element_idx = out_idx;
+                state->heap[heap_size].value.has_value = true;
+                state->heap[heap_size].value.value = it->current_value;
+                heap_size++;
             }
-
-            for (size_t i = 0; i < nodecount; i++) {
-                value_tree[i].has_value = false;
-                idx_tree[i] = -1;
-            }
-
-            KMergNode winner = kmerge_rebuild_loser_tree(0, value_tree, idx_tree, nodecount + elementcount);
-
-            state->value_losertree = (OptU32 *) palloc(sizeof(OptU32) * nodecount);
-            state->idx_losertree = (int *) palloc(sizeof(int) * nodecount);
-            for (size_t i = 0; i < nodecount; i++) {
-                state->value_losertree[i] = value_tree[i];
-                state->idx_losertree[i] = idx_tree[i];
-            }
-            state->nodecount = nodecount;
-            state->winner = winner;
-
-            pfree(value_tree);
-            pfree(idx_tree);
+            out_idx++;
         }
+        state->heap_size = heap_size;
+        if (heap_size > 1)
+            heap_heapify(state->heap, heap_size);
 
         funcctx->user_fctx = state;
         MemoryContextSwitchTo(oldcontext);
@@ -498,30 +375,39 @@ rb_kmerge_avg(PG_FUNCTION_ARGS)
     funcctx = SRF_PERCALL_SETUP();
     KMergeState *state = (KMergeState *) funcctx->user_fctx;
 
-    if (!state->winner.value.has_value) {
+    if (state->heap_size == 0) {
         for (int i = 0; i < state->n; i++) {
             if (state->iters[i])
                 roaring_uint32_iterator_free(state->iters[i]);
         }
         if (state->iters) pfree(state->iters);
         if (state->labels) pfree(state->labels);
-        if (state->value_losertree) pfree(state->value_losertree);
-        if (state->idx_losertree) pfree(state->idx_losertree);
+        if (state->heap) pfree(state->heap);
         pfree(state);
         SRF_RETURN_DONE(funcctx);
     }
 
-    uint32 current_val_u = state->winner.value.value;
+    uint32 current_val_u = state->heap[0].value.value;
 
     double sum = 0.0;
     int cnt = 0;
 
     do {
-        int src = state->winner.element_idx;
+        int src = state->heap[0].element_idx;
         sum += (double) state->labels[src];
         cnt++;
-        kmerge_pop_and_push(state);
-    } while (state->winner.value.has_value && state->winner.value.value == current_val_u);
+        roaring_uint32_iterator_t *it = state->iters[src];
+        roaring_uint32_iterator_advance(it);
+        if (it->has_value) {
+            state->heap[0].value.value = it->current_value;
+            heap_sift_down(state->heap, state->heap_size, 0);
+        } else {
+            state->heap[0] = state->heap[state->heap_size - 1];
+            state->heap_size--;
+            if (state->heap_size > 0)
+                heap_sift_down(state->heap, state->heap_size, 0);
+        }
+    } while (state->heap_size > 0 && state->heap[0].value.value == current_val_u);
 
     double avg = cnt > 0 ? (sum / (double) cnt) : 0.0;
 
