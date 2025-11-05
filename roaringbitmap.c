@@ -3,11 +3,13 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/syscache.h"
 #include "utils/memutils.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_cast.h"
 
 /* Created by ZEROMAX on 2017/3/20.*/
 
@@ -443,6 +445,14 @@ typedef struct {
     Datum *labels;
     Oid label_elem_type;
 
+    /* type layout for labels->input conversion */
+    int16 label_typlen;
+    bool label_typbyval;
+    char label_typalign;
+    int16 input_typlen;
+    bool input_typbyval;
+    char input_typalign;
+
     /* aggregate resolution */
     Oid agg_oid;              /* pg_proc OID of aggregate function */
     Oid trans_type;           /* aggtranstype */
@@ -461,10 +471,18 @@ typedef struct {
     Oid input_in_func;
     Oid input_in_ioparam;
 
+    /* cast resolution for label->input */
+    char label_cast_method;   /* 'b' binary, 'f' function, 'i' io, or 0 if same */
+    FmgrInfo label_cast_fn;   /* valid iff label_cast_method == 'f' */
+
     Oid agg_result_type;      /* prorettype of aggregate function */
     Oid agg_result_out_func;
     Oid result_in_func;       /* for requested anycompatible result type */
     Oid result_in_ioparam;
+
+    /* cast resolution for agg_result -> requested result */
+    char result_cast_method;  /* 'b', 'f', 'i', or 0 if same */
+    FmgrInfo result_cast_fn;  /* valid iff result_cast_method == 'f' */
 
     Oid result_type;          /* resolved anycompatible */
 
@@ -482,6 +500,29 @@ rb_coerce_datum_via_io(Datum value, Oid fromtype, Oid totype,
     Datum res = OidInputFunctionCall(to_in_func, tmp, to_in_ioparam, -1);
     pfree(tmp);
     return res;
+}
+
+/* resolve cast method between two types via pg_cast; returns method char or 0 if same */
+static char
+rb_resolve_cast_method(Oid fromtype, Oid totype, Oid *funcOid)
+{
+    if (fromtype == totype) {
+        if (funcOid) *funcOid = InvalidOid;
+        return 0; /* same type */
+    }
+
+    HeapTuple tup = SearchSysCache2(CASTSOURCETARGET,
+                                    ObjectIdGetDatum(fromtype),
+                                    ObjectIdGetDatum(totype));
+    if (!HeapTupleIsValid(tup)) {
+        if (funcOid) *funcOid = InvalidOid;
+        return 'i'; /* fallback to IO if no explicit cast */
+    }
+    Form_pg_cast castForm = (Form_pg_cast) GETSTRUCT(tup);
+    char method = castForm->castmethod; /* 'b', 'f', or 'i' */
+    if (funcOid) *funcOid = castForm->castfunc;
+    ReleaseSysCache(tup);
+    return method;
 }
 
 Datum
@@ -536,6 +577,43 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         state->heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
         int heap_size = 0;
         int out_idx = 0;
+
+        /* --- Resolve aggregate input/result types early for label coercion --- */
+        /* inspect aggregate pg_proc to get input and result types */
+        HeapTuple procTup_e = SearchSysCache1(PROCOID, ObjectIdGetDatum(agg_oid));
+        if (!HeapTupleIsValid(procTup_e))
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                     errmsg("could not find pg_proc row for aggregate %u", agg_oid)));
+        Form_pg_proc procForm_e = (Form_pg_proc) GETSTRUCT(procTup_e);
+        if (procForm_e->pronargs != 1)
+        {
+            Oid nsp = procForm_e->pronamespace;
+            char *nspname = get_namespace_name(nsp);
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                     errmsg("aggregate %s.%s must take exactly one argument",
+                            nspname ? nspname : "", NameStr(procForm_e->proname))));
+        }
+        state->input_type = procForm_e->proargtypes.values[0];
+        state->agg_result_type = procForm_e->prorettype;
+        ReleaseSysCache(procTup_e);
+
+        /* type layout for copy */
+        get_typlenbyvalalign(state->label_elem_type, &state->label_typlen, &state->label_typbyval, &state->label_typalign);
+        get_typlenbyvalalign(state->input_type, &state->input_typlen, &state->input_typbyval, &state->input_typalign);
+
+        /* resolve label->input cast path */
+        Oid label_cast_func = InvalidOid;
+        state->label_cast_method = rb_resolve_cast_method(state->label_elem_type, state->input_type, &label_cast_func);
+        if (state->label_cast_method == 'f')
+            fmgr_info_cxt(label_cast_func, &state->label_cast_fn, funcctx->multi_call_memory_ctx);
+        /* IO helpers for fallback */
+        {
+            bool junk;
+            getTypeOutputInfo(state->label_elem_type, &state->label_out_func, &junk);
+            getTypeInputInfo(state->input_type, &state->input_in_func, &state->input_in_ioparam);
+        }
         for (int i = 0; i < bnelems; i++) {
             if (bnulls[i]) continue;
 
@@ -553,7 +631,25 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
 
             roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
             state->iters[out_idx] = it;
-            state->labels[out_idx] = lvals[i];
+            /* pre-coerce label to aggregate input type once */
+            {
+                Datum label_val = lvals[i];
+                Datum coerced;
+                if (state->label_cast_method == 0 || state->label_cast_method == 'b') {
+                    coerced = label_val; /* same/binary compatible */
+                } else if (state->label_cast_method == 'f') {
+                    coerced = FunctionCall1(&state->label_cast_fn, label_val);
+                } else {
+                    coerced = rb_coerce_datum_via_io(label_val,
+                                                     state->label_elem_type,
+                                                     state->input_type,
+                                                     state->label_out_func,
+                                                     state->input_in_func,
+                                                     state->input_in_ioparam);
+                }
+                /* copy to multi-call context lifetime */
+                state->labels[out_idx] = datumCopy(coerced, state->input_typbyval, state->input_typlen);
+            }
 
             if (it->has_value) {
                 state->heap[heap_size].element_idx = out_idx;
@@ -598,25 +694,7 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         }
         ReleaseSysCache(aggTup);
 
-        /* inspect aggregate pg_proc to get input and result types */
-        HeapTuple procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(agg_oid));
-        if (!HeapTupleIsValid(procTup))
-            ereport(ERROR,
-                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
-                     errmsg("could not find pg_proc row for aggregate %u", agg_oid)));
-        Form_pg_proc procForm = (Form_pg_proc) GETSTRUCT(procTup);
-        if (procForm->pronargs != 1)
-        {
-            Oid nsp = procForm->pronamespace;
-            char *nspname = get_namespace_name(nsp);
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-                     errmsg("aggregate %s.%s must take exactly one argument",
-                            nspname ? nspname : "", NameStr(procForm->proname))));
-        }
-        state->input_type = procForm->proargtypes.values[0];
-        state->agg_result_type = procForm->prorettype;
-        ReleaseSysCache(procTup);
+        /* input/result types already resolved above */
 
         /* IO helpers */
         bool junk;
@@ -631,6 +709,14 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                      errmsg("could not resolve result type for anycompatible")));
         getTypeInputInfo(state->result_type, &state->result_in_func, &state->result_in_ioparam);
+
+        /* resolve agg_result -> requested result cast once */
+        {
+            Oid res_cast_func = InvalidOid;
+            state->result_cast_method = rb_resolve_cast_method(state->agg_result_type, state->result_type, &res_cast_func);
+            if (state->result_cast_method == 'f')
+                fmgr_info_cxt(res_cast_func, &state->result_cast_fn, funcctx->multi_call_memory_ctx);
+        }
 
         state->pergroup_ctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
                                                     "rb_kmerge_agg pergroup",
@@ -672,17 +758,8 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
     do {
         int src = state->heap[0].element_idx;
 
-        Datum label_val = state->labels[src];
-
-        /* convert label to aggregate input type if needed */
-        Datum input_val = (state->label_elem_type == state->input_type)
-                          ? label_val
-                          : rb_coerce_datum_via_io(label_val,
-                                                   state->label_elem_type,
-                                                   state->input_type,
-                                                   state->label_out_func,
-                                                   state->input_in_func,
-                                                   state->input_in_ioparam);
+        /* use pre-coerced input label */
+        Datum input_val = state->labels[src];
 
         LOCAL_FCINFO(fcinfo_trans, 2);
         InitFunctionCallInfoData(*fcinfo_trans, &state->transfn, 2, InvalidOid, NULL, NULL);
@@ -728,8 +805,10 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
     Datum out_val = (Datum) 0;
     bool out_isnull = final_isnull;
     if (!final_isnull) {
-        if (state->agg_result_type == state->result_type) {
+        if (state->result_cast_method == 0 || state->result_cast_method == 'b') {
             out_val = final_val;
+        } else if (state->result_cast_method == 'f') {
+            out_val = FunctionCall1(&state->result_cast_fn, final_val);
         } else {
             out_val = rb_coerce_datum_via_io(final_val,
                                              state->agg_result_type,
