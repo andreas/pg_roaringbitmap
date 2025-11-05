@@ -258,7 +258,7 @@ CREATE OR REPLACE FUNCTION rb_kmerge_agg(
   agg     regprocedure,
   resulttype anycompatible
 )
-  RETURNS TABLE (element int, agg_value anycompatible)
+  RETURNS SETOF anycompatible
   AS 'MODULE_PATHNAME', 'rb_kmerge_agg'
   LANGUAGE C IMMUTABLE PARALLEL SAFE;
 

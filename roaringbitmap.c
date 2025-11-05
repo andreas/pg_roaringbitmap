@@ -438,7 +438,6 @@ typedef struct {
     roaring_uint32_iterator_t **iters;
     KMergNode *heap;
     int heap_size;
-    TupleDesc tupdesc;
 
     /* labels (one per iterator, corresponding to non-NULL bitmap entries) */
     Datum *labels;
@@ -633,15 +632,6 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
                      errmsg("could not resolve result type for anycompatible")));
         getTypeInputInfo(state->result_type, &state->result_in_func, &state->result_in_ioparam);
 
-        /* result row type */
-        TupleDesc tupdesc;
-        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATATYPE_MISMATCH),
-                     errmsg("return type must be a row type")));
-        BlessTupleDesc(tupdesc);
-        state->tupdesc = tupdesc;
-
         state->pergroup_ctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
                                                     "rb_kmerge_agg pergroup",
                                                     ALLOCSET_DEFAULT_SIZES);
@@ -670,7 +660,6 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
 
     /* current element value */
     uint32 current_val_u = state->heap[0].value.value;
-    int32 current_val = (int32) current_val_u;
 
     /* aggregate across all sources matching current value */
     Datum trans = (Datum) 0;
@@ -734,7 +723,8 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         final_isnull = trans_isnull;
     }
 
-    /* convert final value to requested result_type if needed */
+    /* convert final value to requested result_type if needed, in multi-call ctx */
+    MemoryContext outctx_old = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
     Datum out_val = (Datum) 0;
     bool out_isnull = final_isnull;
     if (!final_isnull) {
@@ -749,23 +739,16 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
                                              state->result_in_ioparam);
         }
     }
-
-    Datum vals[2];
-    bool nulls[2] = {false, false};
-    vals[0] = Int32GetDatum(current_val);
-    if (out_isnull) {
-        nulls[1] = true;
-    } else {
-        vals[1] = out_val;
-    }
-
-    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
+    MemoryContextSwitchTo(outctx_old);
 
     /* reset per-group allocations to avoid leaks */
     MemoryContextSwitchTo(old);
     MemoryContextReset(state->pergroup_ctx);
 
-    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+    if (out_isnull)
+        SRF_RETURN_NEXT(funcctx, (Datum) 0);
+    else
+        SRF_RETURN_NEXT(funcctx, out_val);
 }
 
 //rb_from_bytea
