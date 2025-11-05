@@ -633,3 +633,10 @@ select rb_kmerge_avg(ARRAY[
   rb_build(ARRAY[3,4]),
   rb_build(ARRAY[10,5])
 ], ARRAY[1,2,3]);
+
+
+select rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[1,2,3], 'avg(double precision)'::regprocedure, NULL::float8);

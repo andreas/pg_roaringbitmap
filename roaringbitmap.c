@@ -1,5 +1,13 @@
 #include "roaringbitmap.h"
 #include "utils/lsyscache.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "utils/builtins.h"
+#include "utils/syscache.h"
+#include "utils/memutils.h"
+#include "catalog/pg_aggregate.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 
 /* Created by ZEROMAX on 2017/3/20.*/
 
@@ -97,6 +105,8 @@ PG_FUNCTION_INFO_V1(rb_kmerge);
 Datum rb_kmerge(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(rb_kmerge_avg);
 Datum rb_kmerge_avg(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(rb_kmerge_agg);
+Datum rb_kmerge_agg(PG_FUNCTION_ARGS);
 
 typedef struct {
     uint32 value;
@@ -412,6 +422,350 @@ rb_kmerge_avg(PG_FUNCTION_ARGS)
     double avg = cnt > 0 ? (sum / (double) cnt) : 0.0;
 
     SRF_RETURN_NEXT(funcctx, Float8GetDatum(avg));
+}
+
+/*
+ * rb_kmerge_agg(bitmaps roaringbitmap[], labels anyarray, agg regprocedure, resulttype anycompatible)
+ * Returns TABLE(element int, agg_value anycompatible)
+ *
+ * For each element present across the k input bitmaps, collect the labels
+ * from all bitmaps containing that element and compute the aggregation using
+ * the provided aggregate (resolved via pg_aggregate). The aggregate must be a
+ * normal one-argument aggregate (no ordered-set, no moving-aggregate extras).
+ */
+typedef struct {
+    int n;
+    roaring_uint32_iterator_t **iters;
+    KMergNode *heap;
+    int heap_size;
+    TupleDesc tupdesc;
+
+    /* labels (one per iterator, corresponding to non-NULL bitmap entries) */
+    Datum *labels;
+    Oid label_elem_type;
+
+    /* aggregate resolution */
+    Oid agg_oid;              /* pg_proc OID of aggregate function */
+    Oid trans_type;           /* aggtranstype */
+    Oid input_type;           /* aggregate input argument type */
+    Oid finalfn_oid;          /* optional */
+    FmgrInfo transfn;
+    FmgrInfo finalfn;         /* valid only if finalfn_oid != InvalidOid */
+    bool has_finalfn;
+
+    /* init transition value, if specified */
+    Datum init_trans_value;
+    bool init_trans_isnull;
+
+    /* IO helpers for label->input and (final)->result conversions */
+    Oid label_out_func;
+    Oid input_in_func;
+    Oid input_in_ioparam;
+
+    Oid agg_result_type;      /* prorettype of aggregate function */
+    Oid agg_result_out_func;
+    Oid result_in_func;       /* for requested anycompatible result type */
+    Oid result_in_ioparam;
+
+    Oid result_type;          /* resolved anycompatible */
+
+    MemoryContext pergroup_ctx;
+} KMergeAggState;
+
+static Datum
+rb_coerce_datum_via_io(Datum value, Oid fromtype, Oid totype,
+                       Oid from_out_func, Oid to_in_func, Oid to_in_ioparam)
+{
+    if (fromtype == totype)
+        return value;
+
+    char *tmp = OidOutputFunctionCall(from_out_func, value);
+    Datum res = OidInputFunctionCall(to_in_func, tmp, to_in_ioparam, -1);
+    pfree(tmp);
+    return res;
+}
+
+Datum
+rb_kmerge_agg(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    MemoryContext oldcontext;
+
+    if (SRF_IS_FIRSTCALL()) {
+        ArrayType *arr_bitmaps = PG_GETARG_ARRAYTYPE_P(0);
+        ArrayType *arr_labels = PG_GETARG_ARRAYTYPE_P(1);
+        Oid agg_oid = PG_GETARG_OID(2);
+        funcctx = SRF_FIRSTCALL_INIT();
+
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        /* Prepare bitmap array deconstruction */
+        int16 blen; bool bbyval; char balign;
+        Oid btype = ARR_ELEMTYPE(arr_bitmaps);
+        get_typlenbyvalalign(btype, &blen, &bbyval, &balign);
+
+        /* Labels array */
+        int16 llen; bool lbyval; char lalign;
+        Oid ltype = ARR_ELEMTYPE(arr_labels);
+        get_typlenbyvalalign(ltype, &llen, &lbyval, &lalign);
+
+        Datum *bvals; bool *bnulls; int bnelems;
+        deconstruct_array(arr_bitmaps, btype, blen, bbyval, balign,
+                          &bvals, &bnulls, &bnelems);
+
+        Datum *lvals; bool *lnulls; int lnelems;
+        deconstruct_array(arr_labels, ltype, llen, lbyval, lalign,
+                          &lvals, &lnulls, &lnelems);
+
+        if (lnelems != bnelems)
+            ereport(ERROR,
+                    (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                     errmsg("labels array length must match bitmaps array length")));
+
+        /* Build iterators for non-NULL bitmaps */
+        int count = 0;
+        for (int i = 0; i < bnelems; i++) {
+            if (!bnulls[i]) count++;
+        }
+
+        KMergeAggState *state = (KMergeAggState *) palloc0(sizeof(KMergeAggState));
+        state->n = count;
+        state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
+        state->labels = (Datum *) palloc0(sizeof(Datum) * Max(count, 1));
+        state->label_elem_type = ltype;
+
+        state->heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
+        int heap_size = 0;
+        int out_idx = 0;
+        for (int i = 0; i < bnelems; i++) {
+            if (bnulls[i]) continue;
+
+            if (lnulls && lnulls[i])
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("label value must not be NULL when corresponding bitmap is non-NULL")));
+
+            bytea *data = (bytea *) DatumGetPointer(bvals[i]);
+            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+            if (!rb)
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("bitmap format is error")));
+
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            state->iters[out_idx] = it;
+            state->labels[out_idx] = lvals[i];
+
+            if (it->has_value) {
+                state->heap[heap_size].element_idx = out_idx;
+                state->heap[heap_size].value.has_value = true;
+                state->heap[heap_size].value.value = it->current_value;
+                heap_size++;
+            }
+            out_idx++;
+        }
+        state->heap_size = heap_size;
+        if (heap_size > 1)
+            heap_heapify(state->heap, heap_size);
+
+        /* resolve aggregate */
+        HeapTuple aggTup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(agg_oid));
+        if (!HeapTupleIsValid(aggTup))
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                     errmsg("could not find aggregate with OID %u", agg_oid)));
+
+        Form_pg_aggregate aggForm = (Form_pg_aggregate) GETSTRUCT(aggTup);
+        state->agg_oid = agg_oid;
+        state->trans_type = aggForm->aggtranstype;
+        state->finalfn_oid = aggForm->aggfinalfn;
+        state->has_finalfn = OidIsValid(state->finalfn_oid);
+
+        fmgr_info_cxt(aggForm->aggtransfn, &state->transfn, funcctx->multi_call_memory_ctx);
+        if (state->has_finalfn)
+            fmgr_info_cxt(state->finalfn_oid, &state->finalfn, funcctx->multi_call_memory_ctx);
+
+        /* initval (text) -> Datum of transtype */
+        bool isnull;
+        Datum inittext = SysCacheGetAttr(AGGFNOID, aggTup, Anum_pg_aggregate_agginitval, &isnull);
+        state->init_trans_isnull = true;
+        if (!isnull) {
+            Oid in_func; Oid ioparam;
+            getTypeInputInfo(state->trans_type, &in_func, &ioparam);
+            char *cstr = TextDatumGetCString(inittext);
+            state->init_trans_value = OidInputFunctionCall(in_func, cstr, ioparam, -1);
+            state->init_trans_isnull = false;
+            pfree(cstr);
+        }
+        ReleaseSysCache(aggTup);
+
+        /* inspect aggregate pg_proc to get input and result types */
+        HeapTuple procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(agg_oid));
+        if (!HeapTupleIsValid(procTup))
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                     errmsg("could not find pg_proc row for aggregate %u", agg_oid)));
+        Form_pg_proc procForm = (Form_pg_proc) GETSTRUCT(procTup);
+        if (procForm->pronargs != 1)
+        {
+            Oid nsp = procForm->pronamespace;
+            char *nspname = get_namespace_name(nsp);
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                     errmsg("aggregate %s.%s must take exactly one argument",
+                            nspname ? nspname : "", NameStr(procForm->proname))));
+        }
+        state->input_type = procForm->proargtypes.values[0];
+        state->agg_result_type = procForm->prorettype;
+        ReleaseSysCache(procTup);
+
+        /* IO helpers */
+        bool junk;
+        getTypeOutputInfo(state->label_elem_type, &state->label_out_func, &junk);
+        getTypeInputInfo(state->input_type, &state->input_in_func, &state->input_in_ioparam);
+        getTypeOutputInfo(state->agg_result_type, &state->agg_result_out_func, &junk);
+
+        /* resolve requested anycompatible for result (arg 3) */
+        state->result_type = get_fn_expr_argtype(fcinfo->flinfo, 3);
+        if (!OidIsValid(state->result_type))
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("could not resolve result type for anycompatible")));
+        getTypeInputInfo(state->result_type, &state->result_in_func, &state->result_in_ioparam);
+
+        /* result row type */
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("return type must be a row type")));
+        BlessTupleDesc(tupdesc);
+        state->tupdesc = tupdesc;
+
+        state->pergroup_ctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
+                                                    "rb_kmerge_agg pergroup",
+                                                    ALLOCSET_DEFAULT_SIZES);
+
+        funcctx->user_fctx = state;
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    KMergeAggState *state = (KMergeAggState *) funcctx->user_fctx;
+
+    if (state->heap_size == 0) {
+        for (int i = 0; i < state->n; i++) {
+            if (state->iters[i])
+                roaring_uint32_iterator_free(state->iters[i]);
+        }
+        if (state->iters) pfree(state->iters);
+        if (state->labels) pfree(state->labels);
+        if (state->heap) pfree(state->heap);
+        if (state->pergroup_ctx) MemoryContextDelete(state->pergroup_ctx);
+        pfree(state);
+        SRF_RETURN_DONE(funcctx);
+    }
+
+    MemoryContext old = MemoryContextSwitchTo(state->pergroup_ctx);
+
+    /* current element value */
+    uint32 current_val_u = state->heap[0].value.value;
+    int32 current_val = (int32) current_val_u;
+
+    /* aggregate across all sources matching current value */
+    Datum trans = (Datum) 0;
+    bool trans_isnull = true;
+    if (!state->init_trans_isnull) {
+        trans = state->init_trans_value;
+        trans_isnull = false;
+    }
+
+    do {
+        int src = state->heap[0].element_idx;
+
+        Datum label_val = state->labels[src];
+
+        /* convert label to aggregate input type if needed */
+        Datum input_val = (state->label_elem_type == state->input_type)
+                          ? label_val
+                          : rb_coerce_datum_via_io(label_val,
+                                                   state->label_elem_type,
+                                                   state->input_type,
+                                                   state->label_out_func,
+                                                   state->input_in_func,
+                                                   state->input_in_ioparam);
+
+        LOCAL_FCINFO(fcinfo_trans, 2);
+        InitFunctionCallInfoData(*fcinfo_trans, &state->transfn, 2, InvalidOid, NULL, NULL);
+        fcinfo_trans->args[0].value = trans;
+        fcinfo_trans->args[0].isnull = trans_isnull;
+        fcinfo_trans->args[1].value = input_val;
+        fcinfo_trans->args[1].isnull = false;
+        Datum new_trans = FunctionCallInvoke(fcinfo_trans);
+        trans = new_trans;
+        trans_isnull = fcinfo_trans->isnull;
+
+        /* advance iterator */
+        roaring_uint32_iterator_t *it = state->iters[src];
+        roaring_uint32_iterator_advance(it);
+        if (it->has_value) {
+            state->heap[0].value.value = it->current_value;
+            heap_sift_down(state->heap, state->heap_size, 0);
+        } else {
+            state->heap[0] = state->heap[state->heap_size - 1];
+            state->heap_size--;
+            if (state->heap_size > 0)
+                heap_sift_down(state->heap, state->heap_size, 0);
+        }
+    } while (state->heap_size > 0 && state->heap[0].value.value == current_val_u);
+
+    /* finalize */
+    Datum final_val;
+    bool final_isnull;
+    if (state->has_finalfn) {
+        LOCAL_FCINFO(fcinfo_final, 1);
+        InitFunctionCallInfoData(*fcinfo_final, &state->finalfn, 1, InvalidOid, NULL, NULL);
+        fcinfo_final->args[0].value = trans;
+        fcinfo_final->args[0].isnull = trans_isnull;
+        final_val = FunctionCallInvoke(fcinfo_final);
+        final_isnull = fcinfo_final->isnull;
+    } else {
+        final_val = trans;
+        final_isnull = trans_isnull;
+    }
+
+    /* convert final value to requested result_type if needed */
+    Datum out_val = (Datum) 0;
+    bool out_isnull = final_isnull;
+    if (!final_isnull) {
+        if (state->agg_result_type == state->result_type) {
+            out_val = final_val;
+        } else {
+            out_val = rb_coerce_datum_via_io(final_val,
+                                             state->agg_result_type,
+                                             state->result_type,
+                                             state->agg_result_out_func,
+                                             state->result_in_func,
+                                             state->result_in_ioparam);
+        }
+    }
+
+    Datum vals[2];
+    bool nulls[2] = {false, false};
+    vals[0] = Int32GetDatum(current_val);
+    if (out_isnull) {
+        nulls[1] = true;
+    } else {
+        vals[1] = out_val;
+    }
+
+    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
+
+    /* reset per-group allocations to avoid leaks */
+    MemoryContextSwitchTo(old);
+    MemoryContextReset(state->pergroup_ctx);
+
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
 }
 
 //rb_from_bytea
