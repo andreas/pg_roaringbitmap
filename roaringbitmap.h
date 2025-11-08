@@ -86,6 +86,5 @@ static inline void *pg_realloc(void *ptr, size_t size) {
 }
 
 #include "roaring.c"
-#include "roaring_buffer_reader.c"
 
 #endif
