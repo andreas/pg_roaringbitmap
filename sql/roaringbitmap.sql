@@ -635,8 +635,56 @@ select rb_kmerge_avg(ARRAY[
 ], ARRAY[1,2,3]);
 
 
-select rb_kmerge_agg(ARRAY[
+select * from rb_kmerge_agg(ARRAY[
   rb_build(ARRAY[1,3,5]),
   rb_build(ARRAY[3,4]),
   rb_build(ARRAY[10,5])
-], ARRAY[1,2,3], 'avg(double precision)'::regprocedure, NULL::float8);
+], ARRAY[1,2,3], 'avg(double precision)'::regprocedure) as t(result float8);
+
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[1.5,2.5,3.5], 'avg(double precision)'::regprocedure) as t(result float8);
+
+-- Test every(boolean): boolean input/output
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[true,false,true], 'every(boolean)'::regprocedure) as t(result boolean);
+
+-- Test sum(integer): integer input, bigint output
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Test sum(double precision): double input/output
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[1.1,2.2,3.3], 'sum(double precision)'::regprocedure) as t(result double precision);
+
+-- Test max(integer): integer input/output
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[100,200,300], 'max(integer)'::regprocedure) as t(result integer);
+
+-- Test array_agg(anynonarray): integer input, integer[] output (uses internal transtype)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[10,20,30], 'array_agg(anynonarray)'::regprocedure) as t(result integer[]);
+
+-- Test array_agg(anynonarray): text input, text[] output (uses internal transtype)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY['apple','banana','cherry'], 'array_agg(anynonarray)'::regprocedure) as t(result text[]);

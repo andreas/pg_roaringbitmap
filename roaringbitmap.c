@@ -10,6 +10,9 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_cast.h"
+#include "nodes/execnodes.h"
+#include "nodes/makefuncs.h"
+#include "nodes/primnodes.h"
 
 /* Created by ZEROMAX on 2017/3/20.*/
 
@@ -456,6 +459,8 @@ typedef struct {
     /* aggregate resolution */
     Oid agg_oid;              /* pg_proc OID of aggregate function */
     Oid trans_type;           /* aggtranstype */
+    int16 trans_typlen;       /* transtype length for datumCopy */
+    bool trans_typbyval;      /* transtype pass-by-value for datumCopy */
     Oid input_type;           /* aggregate input argument type */
     Oid finalfn_oid;          /* optional */
     FmgrInfo transfn;
@@ -487,6 +492,10 @@ typedef struct {
     Oid result_type;          /* resolved anycompatible */
 
     MemoryContext pergroup_ctx;
+
+    /* Fake AggState for AggCheckCallContext support (internal transtype aggs) */
+    AggState *fake_aggstate;
+    ExprContext *fake_aggcontext;
 } KMergeAggState;
 
 static Datum
@@ -597,6 +606,16 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         }
         state->input_type = procForm_e->proargtypes.values[0];
         state->agg_result_type = procForm_e->prorettype;
+
+        /* For polymorphic aggregates (e.g., array_agg(anynonarray)),
+         * substitute the actual type from the labels array */
+        if (IsPolymorphicType(state->input_type))
+            state->input_type = state->label_elem_type;
+
+        /* For polymorphic result types (e.g., anyarray from array_agg),
+         * we'll rely on the output column definition from RETURNS record.
+         * Set agg_result_type to the user-specified result_type later. */
+
         ReleaseSysCache(procTup_e);
 
         /* type layout for copy */
@@ -676,7 +695,35 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         state->finalfn_oid = aggForm->aggfinalfn;
         state->has_finalfn = OidIsValid(state->finalfn_oid);
 
+        /* Get transtype layout for datumCopy */
+        get_typlenbyval(state->trans_type, &state->trans_typlen, &state->trans_typbyval);
+
         fmgr_info_cxt(aggForm->aggtransfn, &state->transfn, funcctx->multi_call_memory_ctx);
+
+        /* For polymorphic aggregates (e.g., array_agg), the transition function
+         * calls get_fn_expr_argtype() to determine the actual input type.
+         * We need to set up fn_expr with a FuncExpr that has the resolved types.
+         */
+        {
+            FuncExpr *fexpr = makeNode(FuncExpr);
+            fexpr->funcid = aggForm->aggtransfn;
+            fexpr->funcresulttype = state->trans_type;
+            fexpr->funcretset = false;
+            fexpr->funcvariadic = false;
+            fexpr->funcformat = COERCE_EXPLICIT_CALL;
+            fexpr->funccollid = InvalidOid;
+            fexpr->inputcollid = InvalidOid;
+            fexpr->location = -1;
+            /* Build args list with Const nodes of the correct types.
+             * arg0 = trans_type (internal/state), arg1 = input_type (the actual element type) */
+            Const *arg0 = makeConst(state->trans_type, -1, InvalidOid, -1,
+                                    (Datum) 0, true, false);
+            Const *arg1 = makeConst(state->input_type, -1, InvalidOid, -1,
+                                    (Datum) 0, true, false);
+            fexpr->args = list_make2(arg0, arg1);
+            state->transfn.fn_expr = (Node *) fexpr;
+        }
+
         if (state->has_finalfn)
             fmgr_info_cxt(state->finalfn_oid, &state->finalfn, funcctx->multi_call_memory_ctx);
 
@@ -697,18 +744,31 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         /* input/result types already resolved above */
 
         /* IO helpers */
+        /* get result type from output column definition (RETURNS record) */
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("function returning record called in context that cannot accept type record")));
+        if (tupdesc->natts != 1)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("rb_kmerge_agg expects exactly one output column")));
+        state->result_type = TupleDescAttr(tupdesc, 0)->atttypid;
+        getTypeInputInfo(state->result_type, &state->result_in_func, &state->result_in_ioparam);
+        /* save tupdesc for building result tuples */
+        funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+        /* For polymorphic result types (e.g., anyarray from array_agg),
+         * use the user-specified result_type */
+        if (IsPolymorphicType(state->agg_result_type))
+            state->agg_result_type = state->result_type;
+
+        /* IO helpers - now safe to call since agg_result_type is resolved */
         bool junk;
         getTypeOutputInfo(state->label_elem_type, &state->label_out_func, &junk);
         getTypeInputInfo(state->input_type, &state->input_in_func, &state->input_in_ioparam);
         getTypeOutputInfo(state->agg_result_type, &state->agg_result_out_func, &junk);
-
-        /* resolve requested anycompatible for result (arg 3) */
-        state->result_type = get_fn_expr_argtype(fcinfo->flinfo, 3);
-        if (!OidIsValid(state->result_type))
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("could not resolve result type for anycompatible")));
-        getTypeInputInfo(state->result_type, &state->result_in_func, &state->result_in_ioparam);
 
         /* resolve agg_result -> requested result cast once */
         {
@@ -721,6 +781,21 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         state->pergroup_ctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
                                                     "rb_kmerge_agg pergroup",
                                                     ALLOCSET_DEFAULT_SIZES);
+
+        /* Set up fake AggState for AggCheckCallContext support.
+         * This is needed for aggregates with internal transtype (like array_agg).
+         * We create a minimal AggState with just enough fields set for
+         * AggCheckCallContext() to work properly.
+         */
+        state->fake_aggstate = (AggState *) palloc0(sizeof(AggState));
+        state->fake_aggstate->ss.ps.type = T_AggState;  /* Make IsA(node, AggState) work */
+
+        /* Create a fake ExprContext with the memory context for aggregate state */
+        state->fake_aggcontext = (ExprContext *) palloc0(sizeof(ExprContext));
+        state->fake_aggcontext->ecxt_per_tuple_memory = state->pergroup_ctx;
+
+        /* Point curaggcontext to our fake ExprContext */
+        state->fake_aggstate->curaggcontext = state->fake_aggcontext;
 
         funcctx->user_fctx = state;
         MemoryContextSwitchTo(oldcontext);
@@ -748,10 +823,11 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
     uint32 current_val_u = state->heap[0].value.value;
 
     /* aggregate across all sources matching current value */
+    /* Make a fresh copy of init value for this group to avoid modifying the original */
     Datum trans = (Datum) 0;
     bool trans_isnull = true;
     if (!state->init_trans_isnull) {
-        trans = state->init_trans_value;
+        trans = datumCopy(state->init_trans_value, state->trans_typbyval, state->trans_typlen);
         trans_isnull = false;
     }
 
@@ -762,7 +838,9 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         Datum input_val = state->labels[src];
 
         LOCAL_FCINFO(fcinfo_trans, 2);
-        InitFunctionCallInfoData(*fcinfo_trans, &state->transfn, 2, InvalidOid, NULL, NULL);
+        /* Set context to fake AggState for AggCheckCallContext support */
+        InitFunctionCallInfoData(*fcinfo_trans, &state->transfn, 2, InvalidOid,
+                                 (Node *) state->fake_aggstate, NULL);
         fcinfo_trans->args[0].value = trans;
         fcinfo_trans->args[0].isnull = trans_isnull;
         fcinfo_trans->args[1].value = input_val;
@@ -790,7 +868,9 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
     bool final_isnull;
     if (state->has_finalfn) {
         LOCAL_FCINFO(fcinfo_final, 1);
-        InitFunctionCallInfoData(*fcinfo_final, &state->finalfn, 1, InvalidOid, NULL, NULL);
+        /* Set context to fake AggState for AggCheckCallContext support */
+        InitFunctionCallInfoData(*fcinfo_final, &state->finalfn, 1, InvalidOid,
+                                 (Node *) state->fake_aggstate, NULL);
         fcinfo_final->args[0].value = trans;
         fcinfo_final->args[0].isnull = trans_isnull;
         final_val = FunctionCallInvoke(fcinfo_final);
@@ -824,10 +904,13 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
     MemoryContextSwitchTo(old);
     MemoryContextReset(state->pergroup_ctx);
 
-    if (out_isnull)
-        SRF_RETURN_NEXT(funcctx, (Datum) 0);
-    else
-        SRF_RETURN_NEXT(funcctx, out_val);
+    /* build result tuple */
+    Datum values[1];
+    bool nulls[1];
+    values[0] = out_val;
+    nulls[0] = out_isnull;
+    HeapTuple tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
 }
 
 //rb_from_bytea
