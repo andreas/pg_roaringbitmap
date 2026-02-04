@@ -466,6 +466,7 @@ typedef struct {
     FmgrInfo transfn;
     FmgrInfo finalfn;         /* valid only if finalfn_oid != InvalidOid */
     bool has_finalfn;
+    bool transfn_strict;      /* true if transfn is strict */
 
     /* init transition value, if specified */
     Datum init_trans_value;
@@ -499,16 +500,32 @@ typedef struct {
 } KMergeAggState;
 
 static Datum
-rb_coerce_datum_via_io(Datum value, Oid fromtype, Oid totype,
-                       Oid from_out_func, Oid to_in_func, Oid to_in_ioparam)
+rb_coerce_datum_via_io(Datum value, Oid from_out_func, Oid to_in_func, Oid to_in_ioparam)
 {
-    if (fromtype == totype)
-        return value;
-
     char *tmp = OidOutputFunctionCall(from_out_func, value);
     Datum res = OidInputFunctionCall(to_in_func, tmp, to_in_ioparam, -1);
     pfree(tmp);
     return res;
+}
+
+/*
+ * Apply a resolved cast to a datum.
+ * cast_method: 0 = same type, 'b' = binary compatible, 'f' = function, 'i' = IO
+ */
+static Datum
+rb_apply_cast(Datum value, char cast_method, FmgrInfo *cast_fn,
+              Oid from_out_func, Oid to_in_func, Oid to_in_ioparam)
+{
+    switch (cast_method) {
+        case 0:   /* same type */
+        case 'b': /* binary compatible */
+            return value;
+        case 'f': /* cast function */
+            return FunctionCall1(cast_fn, value);
+        case 'i': /* IO conversion */
+        default:
+            return rb_coerce_datum_via_io(value, from_out_func, to_in_func, to_in_ioparam);
+    }
 }
 
 /* resolve cast method between two types via pg_cast; returns method char or 0 if same */
@@ -627,12 +644,14 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         state->label_cast_method = rb_resolve_cast_method(state->label_elem_type, state->input_type, &label_cast_func);
         if (state->label_cast_method == 'f')
             fmgr_info_cxt(label_cast_func, &state->label_cast_fn, funcctx->multi_call_memory_ctx);
-        /* IO helpers for fallback */
+
+        /* IO helpers for label->input conversion (used if cast method is 'i') */
         {
-            bool junk;
-            getTypeOutputInfo(state->label_elem_type, &state->label_out_func, &junk);
+            bool typIsVarlena;
+            getTypeOutputInfo(state->label_elem_type, &state->label_out_func, &typIsVarlena);
             getTypeInputInfo(state->input_type, &state->input_in_func, &state->input_in_ioparam);
         }
+
         for (int i = 0; i < bnelems; i++) {
             if (bnulls[i]) continue;
 
@@ -652,20 +671,11 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
             state->iters[out_idx] = it;
             /* pre-coerce label to aggregate input type once */
             {
-                Datum label_val = lvals[i];
-                Datum coerced;
-                if (state->label_cast_method == 0 || state->label_cast_method == 'b') {
-                    coerced = label_val; /* same/binary compatible */
-                } else if (state->label_cast_method == 'f') {
-                    coerced = FunctionCall1(&state->label_cast_fn, label_val);
-                } else {
-                    coerced = rb_coerce_datum_via_io(label_val,
-                                                     state->label_elem_type,
-                                                     state->input_type,
-                                                     state->label_out_func,
-                                                     state->input_in_func,
-                                                     state->input_in_ioparam);
-                }
+                Datum coerced = rb_apply_cast(lvals[i], state->label_cast_method,
+                                              &state->label_cast_fn,
+                                              state->label_out_func,
+                                              state->input_in_func,
+                                              state->input_in_ioparam);
                 /* copy to multi-call context lifetime */
                 state->labels[out_idx] = datumCopy(coerced, state->input_typbyval, state->input_typlen);
             }
@@ -699,6 +709,7 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         get_typlenbyval(state->trans_type, &state->trans_typlen, &state->trans_typbyval);
 
         fmgr_info_cxt(aggForm->aggtransfn, &state->transfn, funcctx->multi_call_memory_ctx);
+        state->transfn_strict = state->transfn.fn_strict;
 
         /* For polymorphic aggregates (e.g., array_agg), the transition function
          * calls get_fn_expr_argtype() to determine the actual input type.
@@ -764,11 +775,11 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         if (IsPolymorphicType(state->agg_result_type))
             state->agg_result_type = state->result_type;
 
-        /* IO helpers - now safe to call since agg_result_type is resolved */
-        bool junk;
-        getTypeOutputInfo(state->label_elem_type, &state->label_out_func, &junk);
-        getTypeInputInfo(state->input_type, &state->input_in_func, &state->input_in_ioparam);
-        getTypeOutputInfo(state->agg_result_type, &state->agg_result_out_func, &junk);
+        /* IO helper for agg_result -> result conversion (deferred until agg_result_type is resolved) */
+        {
+            bool typIsVarlena;
+            getTypeOutputInfo(state->agg_result_type, &state->agg_result_out_func, &typIsVarlena);
+        }
 
         /* resolve agg_result -> requested result cast once */
         {
@@ -809,15 +820,15 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
             if (state->iters[i])
                 roaring_uint32_iterator_free(state->iters[i]);
         }
-        if (state->iters) pfree(state->iters);
-        if (state->labels) pfree(state->labels);
-        if (state->heap) pfree(state->heap);
-        if (state->pergroup_ctx) MemoryContextDelete(state->pergroup_ctx);
-        pfree(state);
+        if (state->pergroup_ctx)
+            MemoryContextDelete(state->pergroup_ctx);
+        /* remaining allocations (iters, labels, heap, state) live in multi_call_memory_ctx
+         * and will be freed automatically when the SRF completes */
         SRF_RETURN_DONE(funcctx);
     }
 
-    MemoryContext old = MemoryContextSwitchTo(state->pergroup_ctx);
+    /* Save original context and switch to per-group context for aggregate computation */
+    MemoryContext agg_ctx = MemoryContextSwitchTo(state->pergroup_ctx);
 
     /* current element value */
     uint32 current_val_u = state->heap[0].value.value;
@@ -837,17 +848,25 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
         /* use pre-coerced input label */
         Datum input_val = state->labels[src];
 
-        LOCAL_FCINFO(fcinfo_trans, 2);
-        /* Set context to fake AggState for AggCheckCallContext support */
-        InitFunctionCallInfoData(*fcinfo_trans, &state->transfn, 2, InvalidOid,
-                                 (Node *) state->fake_aggstate, NULL);
-        fcinfo_trans->args[0].value = trans;
-        fcinfo_trans->args[0].isnull = trans_isnull;
-        fcinfo_trans->args[1].value = input_val;
-        fcinfo_trans->args[1].isnull = false;
-        Datum new_trans = FunctionCallInvoke(fcinfo_trans);
-        trans = new_trans;
-        trans_isnull = fcinfo_trans->isnull;
+        /* For strict transition functions with NULL trans, the first input becomes
+         * the new trans value directly (skipping the function call). This matches
+         * PostgreSQL's aggregate semantics for aggregates like min/max without initval. */
+        if (state->transfn_strict && trans_isnull) {
+            trans = datumCopy(input_val, state->input_typbyval, state->input_typlen);
+            trans_isnull = false;
+        } else {
+            LOCAL_FCINFO(fcinfo_trans, 2);
+            /* Set context to fake AggState for AggCheckCallContext support */
+            InitFunctionCallInfoData(*fcinfo_trans, &state->transfn, 2, InvalidOid,
+                                     (Node *) state->fake_aggstate, NULL);
+            fcinfo_trans->args[0].value = trans;
+            fcinfo_trans->args[0].isnull = trans_isnull;
+            fcinfo_trans->args[1].value = input_val;
+            fcinfo_trans->args[1].isnull = false;
+            Datum new_trans = FunctionCallInvoke(fcinfo_trans);
+            trans = new_trans;
+            trans_isnull = fcinfo_trans->isnull;
+        }
 
         /* advance iterator */
         roaring_uint32_iterator_t *it = state->iters[src];
@@ -881,28 +900,22 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
     }
 
     /* convert final value to requested result_type if needed, in multi-call ctx */
-    MemoryContext outctx_old = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+    MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
     Datum out_val = (Datum) 0;
     bool out_isnull = final_isnull;
     if (!final_isnull) {
-        if (state->result_cast_method == 0 || state->result_cast_method == 'b') {
-            out_val = final_val;
-        } else if (state->result_cast_method == 'f') {
-            out_val = FunctionCall1(&state->result_cast_fn, final_val);
-        } else {
-            out_val = rb_coerce_datum_via_io(final_val,
-                                             state->agg_result_type,
-                                             state->result_type,
-                                             state->agg_result_out_func,
-                                             state->result_in_func,
-                                             state->result_in_ioparam);
-        }
+        out_val = rb_apply_cast(final_val, state->result_cast_method,
+                                &state->result_cast_fn,
+                                state->agg_result_out_func,
+                                state->result_in_func,
+                                state->result_in_ioparam);
     }
-    MemoryContextSwitchTo(outctx_old);
 
     /* reset per-group allocations to avoid leaks */
-    MemoryContextSwitchTo(old);
     MemoryContextReset(state->pergroup_ctx);
+
+    /* restore original context before returning */
+    MemoryContextSwitchTo(agg_ctx);
 
     /* build result tuple */
     Datum values[1];

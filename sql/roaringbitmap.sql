@@ -688,3 +688,144 @@ select * from rb_kmerge_agg(ARRAY[
   rb_build(ARRAY[3,4]),
   rb_build(ARRAY[10,5])
 ], ARRAY['apple','banana','cherry'], 'array_agg(anynonarray)'::regprocedure) as t(result text[]);
+
+-- ============================================================
+-- Edge case tests for rb_kmerge_agg
+-- ============================================================
+
+-- Edge case: Empty bitmap array - should return no rows
+select * from rb_kmerge_agg(ARRAY[]::roaringbitmap[], ARRAY[]::integer[], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: All NULL bitmaps - should return no rows (NULLs are skipped)
+select * from rb_kmerge_agg(ARRAY[NULL,NULL,NULL]::roaringbitmap[], ARRAY[1,2,3], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: Some NULL bitmaps mixed with non-NULL - NULLs skipped
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3]),
+  NULL,
+  rb_build(ARRAY[3,5])
+], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: Empty bitmaps (no bits set) - should return no rows for those
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[]::integer[]),
+  rb_build(ARRAY[1,2]),
+  rb_build(ARRAY[]::integer[])
+], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: Single bitmap
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2,3])
+], ARRAY[100], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: Single element bitmap
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[42])
+], ARRAY[999], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Error case: count doesn't have a typed variant like count(integer)
+-- (PostgreSQL's count is only count(*) or count(any) which doesn't resolve to a specific OID)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[10,20,30], 'count(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: min aggregate
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY[100,200,300], 'min(integer)'::regprocedure) as t(result integer);
+
+-- Edge case: Type coercion - integer labels with avg (needs double precision)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3]),
+  rb_build(ARRAY[3,5])
+], ARRAY[10,20], 'avg(double precision)'::regprocedure) as t(result float8);
+
+-- Edge case: bigint labels with sum(bigint)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2]),
+  rb_build(ARRAY[2,3])
+], ARRAY[1000000000000::bigint, 2000000000000::bigint], 'sum(bigint)'::regprocedure) as t(result numeric);
+
+-- Error case: string_agg takes 2 arguments (value, separator) which we don't support
+-- rb_kmerge_agg only supports single-argument aggregates
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+], ARRAY['a','b','c'], 'string_agg(text,text)'::regprocedure) as t(result text);
+
+-- Error case: Mismatched array lengths (more labels than bitmaps)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2])
+], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Error case: Mismatched array lengths (more bitmaps than labels)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[5,6])
+], ARRAY[10], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Error case: NULL label with non-NULL bitmap
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2]),
+  rb_build(ARRAY[3,4])
+], ARRAY[10,NULL], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Error case: Invalid aggregate OID
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2])
+], ARRAY[10], 0::regprocedure) as t(result bigint);
+
+-- Error case: Function that is not an aggregate
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2])
+], ARRAY[10], 'abs(integer)'::regprocedure) as t(result integer);
+
+-- Error case: Aggregate with wrong number of arguments (zero args)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2])
+], ARRAY[10], 'count(*)'::regprocedure) as t(result bigint);
+
+-- Error case: Wrong output column count
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2])
+], ARRAY[10], 'sum(integer)'::regprocedure) as t(a bigint, b bigint);
+
+-- Edge case: numeric type (arbitrary precision)
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2]),
+  rb_build(ARRAY[2,3])
+], ARRAY[1.23456789012345::numeric, 9.87654321098765::numeric], 'sum(numeric)'::regprocedure) as t(result numeric);
+
+-- Edge case: Overlapping values in all bitmaps
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,2,3]),
+  rb_build(ARRAY[1,2,3]),
+  rb_build(ARRAY[1,2,3])
+], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: Large overlapping set
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1]),
+  rb_build(ARRAY[1]),
+  rb_build(ARRAY[1]),
+  rb_build(ARRAY[1]),
+  rb_build(ARRAY[1])
+], ARRAY[1,2,3,4,5], 'sum(integer)'::regprocedure) as t(result bigint);
+
+-- Edge case: bit_or aggregate
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3]),
+  rb_build(ARRAY[3,5])
+], ARRAY[1,2], 'bit_or(integer)'::regprocedure) as t(result integer);
+
+-- Edge case: bit_and aggregate
+select * from rb_kmerge_agg(ARRAY[
+  rb_build(ARRAY[1,3]),
+  rb_build(ARRAY[3,5])
+], ARRAY[3,7], 'bit_and(integer)'::regprocedure) as t(result integer);
