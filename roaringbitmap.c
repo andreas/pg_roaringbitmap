@@ -112,6 +112,8 @@ PG_FUNCTION_INFO_V1(rb_kmerge_avg);
 Datum rb_kmerge_avg(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(rb_kmerge_agg);
 Datum rb_kmerge_agg(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(rb_kmerge_groups);
+Datum rb_kmerge_groups(PG_FUNCTION_ARGS);
 
 typedef struct {
     uint32 value;
@@ -923,6 +925,371 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
     values[0] = out_val;
     nulls[0] = out_isnull;
     HeapTuple tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+}
+
+/* ============================================================
+ * rb_kmerge_groups: group elements by source-set pattern
+ * ============================================================
+ *
+ * Given N bitmaps, performs a k-way merge and groups elements by which
+ * combination of input bitmaps contains them. Returns one row per unique
+ * source-set pattern with:
+ *   sources int[]         - 1-based indices of input bitmaps
+ *   members roaringbitmap - all elements sharing this source-set
+ *
+ * The source-set is encoded as a variable-width bitmask of ceil(N/64)
+ * uint64 words, so there is no upper limit on the number of inputs.
+ *
+ * Much more compact than rb_kmerge when many elements share the same
+ * source-set (e.g. 200K employees across 33 question bitmaps -> ~200 groups).
+ */
+
+#define KMGROUPS_HT_INIT_CAP 256
+
+/*
+ * Stride-based open-addressing hash table.
+ *
+ * Each slot is laid out as:
+ *   uint64 words[nwords]     -- the source-set bitmask (all-zero = empty)
+ *   roaring_bitmap_t *members
+ *
+ * Total slot size (stride) = nwords * 8 + sizeof(pointer).
+ */
+
+typedef struct {
+    char *data;          /* flat array of stride-sized slots */
+    int capacity;        /* number of slots (power of 2) */
+    int count;           /* number of occupied slots */
+    int nwords;          /* width of bitmask in uint64 words */
+    Size stride;         /* bytes per slot */
+} KMGroupHT;
+
+/* Access helpers for stride-based slots */
+static inline uint64 *
+kmg_slot_words(KMGroupHT *ht, int idx)
+{
+    return (uint64 *) (ht->data + (Size) idx * ht->stride);
+}
+
+static inline roaring_bitmap_t **
+kmg_slot_members_ptr(KMGroupHT *ht, int idx)
+{
+    return (roaring_bitmap_t **) (ht->data + (Size) idx * ht->stride
+                                  + ht->nwords * sizeof(uint64));
+}
+
+static inline bool
+kmg_slot_empty(KMGroupHT *ht, int idx)
+{
+    uint64 *w = kmg_slot_words(ht, idx);
+    for (int i = 0; i < ht->nwords; i++) {
+        if (w[i] != 0) return false;
+    }
+    return true;
+}
+
+static inline bool
+kmg_words_equal(const uint64 *a, const uint64 *b, int nwords)
+{
+    return memcmp(a, b, nwords * sizeof(uint64)) == 0;
+}
+
+/* Hash: XOR-fold all words with splitmix64 mixing */
+static inline uint32
+kmg_hash(const uint64 *words, int nwords)
+{
+    uint64 h = 0;
+    for (int i = 0; i < nwords; i++) {
+        h ^= words[i];
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27;
+        h *= 0x94d049bb133111ebULL;
+        h ^= h >> 31;
+    }
+    return (uint32) h;
+}
+
+static void
+kmg_ht_init(KMGroupHT *ht, int nwords, int init_cap)
+{
+    ht->nwords = nwords;
+    ht->stride = nwords * sizeof(uint64) + sizeof(roaring_bitmap_t *);
+    ht->capacity = init_cap;
+    ht->count = 0;
+    ht->data = (char *) palloc0((Size) init_cap * ht->stride);
+}
+
+static void
+kmg_ht_resize(KMGroupHT *ht)
+{
+    int old_cap = ht->capacity;
+    char *old_data = ht->data;
+    Size old_stride = ht->stride;
+    int new_cap = old_cap * 2;
+    int new_mask = new_cap - 1;
+
+    ht->data = (char *) palloc0((Size) new_cap * ht->stride);
+    ht->capacity = new_cap;
+
+    for (int i = 0; i < old_cap; i++) {
+        uint64 *w = (uint64 *) (old_data + (Size) i * old_stride);
+        /* check if slot occupied (any word non-zero) */
+        bool occupied = false;
+        for (int j = 0; j < ht->nwords; j++) {
+            if (w[j] != 0) { occupied = true; break; }
+        }
+        if (!occupied) continue;
+
+        roaring_bitmap_t *members = *(roaring_bitmap_t **) (old_data + (Size) i * old_stride
+                                                             + ht->nwords * sizeof(uint64));
+        uint32 h = kmg_hash(w, ht->nwords);
+        int idx = h & new_mask;
+        while (!kmg_slot_empty(ht, idx))
+            idx = (idx + 1) & new_mask;
+        memcpy(kmg_slot_words(ht, idx), w, ht->nwords * sizeof(uint64));
+        *kmg_slot_members_ptr(ht, idx) = members;
+    }
+
+    pfree(old_data);
+}
+
+static roaring_bitmap_t *
+kmg_ht_get_or_create(KMGroupHT *ht, const uint64 *bitmask)
+{
+    int mask, idx;
+    uint32 h;
+
+    if (ht->count * 2 >= ht->capacity)
+        kmg_ht_resize(ht);
+
+    mask = ht->capacity - 1;
+    h = kmg_hash(bitmask, ht->nwords);
+    idx = h & mask;
+
+    while (!kmg_slot_empty(ht, idx)) {
+        if (kmg_words_equal(kmg_slot_words(ht, idx), bitmask, ht->nwords))
+            return *kmg_slot_members_ptr(ht, idx);
+        idx = (idx + 1) & mask;
+    }
+
+    memcpy(kmg_slot_words(ht, idx), bitmask, ht->nwords * sizeof(uint64));
+    *kmg_slot_members_ptr(ht, idx) = roaring_bitmap_create();
+    ht->count++;
+    return *kmg_slot_members_ptr(ht, idx);
+}
+
+/* Result entry stored after merge for SRF iteration */
+typedef struct {
+    uint64 *words;              /* palloc'd copy, nwords uint64s */
+    roaring_bitmap_t *members;
+} KMGroupResult;
+
+typedef struct {
+    int n_results;
+    int current_result;
+    int nwords;
+    KMGroupResult *results;
+    TupleDesc tupdesc;
+} KMergeGroupsState;
+
+/* Compare two KMGroupResult by bitmask words (lexicographic, low word first) */
+static int nwords_for_cmp;  /* set before qsort call */
+
+static int
+kmgroup_cmp(const void *a, const void *b)
+{
+    const uint64 *wa = ((const KMGroupResult *) a)->words;
+    const uint64 *wb = ((const KMGroupResult *) b)->words;
+    for (int i = 0; i < nwords_for_cmp; i++) {
+        if (wa[i] < wb[i]) return -1;
+        if (wa[i] > wb[i]) return 1;
+    }
+    return 0;
+}
+
+Datum
+rb_kmerge_groups(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    MemoryContext oldcontext;
+
+    if (SRF_IS_FIRSTCALL()) {
+        ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        int16 elmlen;
+        bool elmbyval;
+        char elmalign;
+        Oid elmtype = ARR_ELEMTYPE(arr);
+        get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+
+        Datum *elem_values;
+        bool *elem_nulls;
+        int nelems;
+        deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
+                          &elem_values, &elem_nulls, &nelems);
+
+        int count = 0;
+        for (int i = 0; i < nelems; i++) {
+            if (!elem_nulls[i]) count++;
+        }
+
+        int nwords = (count + 63) / 64;
+        if (nwords < 1) nwords = 1;
+
+        /* Build iterators and min-heap */
+        roaring_uint32_iterator_t **iters =
+            (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
+        KMergNode *heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
+        int heap_size = 0;
+        int out_idx = 0;
+
+        for (int i = 0; i < nelems; i++) {
+            if (elem_nulls[i]) continue;
+            bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
+            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+            if (!rb)
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("bitmap format is error")));
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            iters[out_idx] = it;
+            if (it->has_value) {
+                heap[heap_size].element_idx = out_idx;
+                heap[heap_size].value.has_value = true;
+                heap[heap_size].value.value = it->current_value;
+                heap_size++;
+            }
+            out_idx++;
+        }
+
+        if (heap_size > 1)
+            heap_heapify(heap, heap_size);
+
+        /* K-merge: group elements by source-set bitmask */
+        KMGroupHT ht;
+        kmg_ht_init(&ht, nwords, KMGROUPS_HT_INIT_CAP);
+
+        /* Scratch buffer for building bitmask each iteration */
+        uint64 *bitmask_buf = (uint64 *) palloc0(nwords * sizeof(uint64));
+
+        while (heap_size > 0) {
+            uint32 current_val = heap[0].value.value;
+            memset(bitmask_buf, 0, nwords * sizeof(uint64));
+
+            do {
+                int src = heap[0].element_idx;
+                bitmask_buf[src / 64] |= ((uint64) 1) << (src % 64);
+
+                roaring_uint32_iterator_t *it = iters[src];
+                roaring_uint32_iterator_advance(it);
+                if (it->has_value) {
+                    heap[0].value.value = it->current_value;
+                    heap_sift_down(heap, heap_size, 0);
+                } else {
+                    heap[0] = heap[heap_size - 1];
+                    heap_size--;
+                    if (heap_size > 0)
+                        heap_sift_down(heap, heap_size, 0);
+                }
+            } while (heap_size > 0 && heap[0].value.value == current_val);
+
+            roaring_bitmap_t *members = kmg_ht_get_or_create(&ht, bitmask_buf);
+            roaring_bitmap_add(members, current_val);
+        }
+
+        pfree(bitmask_buf);
+
+        /* Free iterators */
+        for (int i = 0; i < count; i++) {
+            if (iters[i])
+                roaring_uint32_iterator_free(iters[i]);
+        }
+        pfree(iters);
+        pfree(heap);
+
+        /* Collect results from hash table */
+        KMergeGroupsState *state = (KMergeGroupsState *) palloc0(sizeof(KMergeGroupsState));
+        state->n_results = ht.count;
+        state->current_result = 0;
+        state->nwords = nwords;
+        state->results = (KMGroupResult *) palloc(sizeof(KMGroupResult) * Max(ht.count, 1));
+
+        int ridx = 0;
+        for (int i = 0; i < ht.capacity; i++) {
+            if (!kmg_slot_empty(&ht, i)) {
+                state->results[ridx].words = (uint64 *) palloc(nwords * sizeof(uint64));
+                memcpy(state->results[ridx].words, kmg_slot_words(&ht, i),
+                       nwords * sizeof(uint64));
+                state->results[ridx].members = *kmg_slot_members_ptr(&ht, i);
+                ridx++;
+            }
+        }
+        pfree(ht.data);
+
+        /* Sort by bitmask (lexicographic, low word first) for deterministic output */
+        nwords_for_cmp = nwords;
+        qsort(state->results, state->n_results, sizeof(KMGroupResult), kmgroup_cmp);
+
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("return type must be a row type")));
+        BlessTupleDesc(tupdesc);
+        state->tupdesc = tupdesc;
+
+        funcctx->user_fctx = state;
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    KMergeGroupsState *state = (KMergeGroupsState *) funcctx->user_fctx;
+
+    if (state->current_result >= state->n_results)
+        SRF_RETURN_DONE(funcctx);
+
+    int idx = state->current_result++;
+    uint64 *words = state->results[idx].words;
+    roaring_bitmap_t *members = state->results[idx].members;
+    int nwords = state->nwords;
+
+    /* Convert bitmask words to int[] of 1-based source indices */
+    int nsources = 0;
+    for (int w = 0; w < nwords; w++) {
+        uint64 v = words[w];
+        while (v) { nsources++; v &= v - 1; } /* popcount */
+    }
+
+    Datum *src_datums = (Datum *) palloc(sizeof(Datum) * nsources);
+    int sidx = 0;
+    for (int w = 0; w < nwords; w++) {
+        uint64 v = words[w];
+        int base = w * 64;
+        while (v) {
+            int bit = __builtin_ctzll(v);
+            src_datums[sidx++] = Int32GetDatum(base + bit + 1);
+            v &= v - 1;
+        }
+    }
+    ArrayType *src_array = construct_array(src_datums, nsources, INT4OID,
+                                           sizeof(int32), true, 'i');
+
+    /* Serialize members bitmap */
+    size_t portable_size = roaring_bitmap_portable_size_in_bytes(members);
+    bytea *serialized = (bytea *) palloc(VARHDRSZ + portable_size);
+    roaring_bitmap_portable_serialize(members, VARDATA(serialized));
+    SET_VARSIZE(serialized, VARHDRSZ + portable_size);
+
+    Datum vals[2];
+    bool nulls[2] = {false, false};
+    vals[0] = PointerGetDatum(src_array);
+    vals[1] = PointerGetDatum(serialized);
+
+    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
     SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
 }
 

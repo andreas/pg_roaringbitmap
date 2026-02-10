@@ -261,6 +261,11 @@ CREATE OR REPLACE FUNCTION rb_kmerge_agg(
   AS 'MODULE_PATHNAME', 'rb_kmerge_agg'
   LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
+CREATE OR REPLACE FUNCTION rb_kmerge_groups(bitmaps roaringbitmap[])
+  RETURNS TABLE (sources int[], members roaringbitmap)
+  AS 'MODULE_PATHNAME', 'rb_kmerge_groups'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
 --
 -- Operators
 --

@@ -46,3 +46,8 @@ CREATE OR REPLACE FUNCTION rb_kmerge_avg(bitmaps roaringbitmap[], labels int[])
   AS 'MODULE_PATHNAME', 'rb_kmerge_avg'
   LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
+CREATE OR REPLACE FUNCTION rb_kmerge_groups(bitmaps roaringbitmap[])
+  RETURNS TABLE (sources int[], members roaringbitmap)
+  AS 'MODULE_PATHNAME', 'rb_kmerge_groups'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+

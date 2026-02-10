@@ -829,3 +829,92 @@ select * from rb_kmerge_agg(ARRAY[
   rb_build(ARRAY[1,3]),
   rb_build(ARRAY[3,5])
 ], ARRAY[3,7], 'bit_and(integer)'::regprocedure) as t(result integer);
+
+-- ============================================================
+-- rb_kmerge_groups tests
+-- ============================================================
+
+-- Basic: same data as rb_kmerge test
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+]);
+
+-- Grouping: many elements share the same source-set
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[1,2,3,4,5]),
+  rb_build(ARRAY[1,2,3])
+]);
+
+-- Realistic: 3 question bitmaps with overlapping employee sets
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[1,2,3,4,5,6,7,8,9,10]),
+  rb_build(ARRAY[1,2,3,4,5,11,12]),
+  rb_build(ARRAY[1,2,3,13,14,15])
+]);
+
+-- All elements in all bitmaps -> single group
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[1,2,3]),
+  rb_build(ARRAY[1,2,3]),
+  rb_build(ARRAY[1,2,3])
+]);
+
+-- Empty array -> no rows
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[]::roaringbitmap[]);
+
+-- All NULL bitmaps -> no rows
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[NULL,NULL,NULL]::roaringbitmap[]);
+
+-- Some NULL bitmaps (skipped, remaining get consecutive indices)
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[1,3]),
+  NULL,
+  rb_build(ARRAY[3,5])
+]);
+
+-- Empty bitmaps (no bits set)
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[]::integer[]),
+  rb_build(ARRAY[1,2]),
+  rb_build(ARRAY[]::integer[])
+]);
+
+-- Single bitmap
+select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[1,2,3])
+]);
+
+-- N > 64: exercise variable-width bitmask (65 inputs, requires 2 uint64 words)
+-- Build 65 bitmaps where element 1 is in all, element 2 only in bitmap 1, element 3 only in bitmap 65
+select sources, rb_to_array(members) from rb_kmerge_groups(
+  (select array_agg(
+    case
+      when i = 1 then rb_build(ARRAY[1,2])
+      when i = 65 then rb_build(ARRAY[1,3])
+      else rb_build(ARRAY[1])
+    end order by i
+  ) from generate_series(1, 65) i)
+);
+
+-- N = 100: larger than 64, element 99 only in bitmaps 1 and 100
+select sources, rb_to_array(members) from rb_kmerge_groups(
+  (select array_agg(
+    case
+      when i = 1 then rb_build(ARRAY[42, 99])
+      when i = 100 then rb_build(ARRAY[42, 99])
+      else rb_build(ARRAY[42])
+    end order by i
+  ) from generate_series(1, 100) i)
+);
+
+-- N = 128: exactly 2 words boundary, all bitmaps contain element 7
+select count(*), (select count(distinct sources::text) from rb_kmerge_groups(
+  (select array_agg(rb_build(ARRAY[7]) order by i) from generate_series(1, 128) i)
+)) as n_groups from generate_series(1,1);
+
+-- N = 65, disjoint: each bitmap has a unique element -> 65 groups
+select count(*) from rb_kmerge_groups(
+  (select array_agg(rb_build(ARRAY[i]) order by i) from generate_series(1, 65) i)
+);
