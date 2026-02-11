@@ -659,7 +659,7 @@ select sources, rb_to_array(members) from rb_kmerge(ARRAY[]::roaringbitmap[]);
 -- All NULL bitmaps -> no rows
 select sources, rb_to_array(members) from rb_kmerge(ARRAY[NULL,NULL,NULL]::roaringbitmap[]);
 
--- Some NULL bitmaps (skipped, remaining get consecutive indices)
+-- Some NULL bitmaps (skipped, but preserve source indices)
 select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[1,3]),
   NULL,

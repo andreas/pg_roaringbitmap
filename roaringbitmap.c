@@ -237,15 +237,7 @@ rb_kmerge(PG_FUNCTION_ARGS)
         deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
                           &elem_values, &elem_nulls, &nelems);
 
-        /* Count non-NULL bitmaps */
-        int count = 0;
-        for (int i = 0; i < nelems; i++)
-        {
-            if (!elem_nulls[i])
-                count++;
-        }
-
-        int nwords = (count + 63) / 64;
+        int nwords = (nelems + 63) / 64;
         if (nwords < 1) nwords = 1;
         if (nwords > KM_MAX_WORDS)
             ereport(ERROR,
@@ -253,14 +245,13 @@ rb_kmerge(PG_FUNCTION_ARGS)
                      errmsg("rb_kmerge supports at most %d inputs",
                             KM_MAX_WORDS * 64)));
 
-        /* Deserialize bitmaps and create iterators */
+        /* Deserialize bitmaps and create iterators (indexed by array position) */
         roaring_uint32_iterator_t **iters =
             (roaring_uint32_iterator_t **) palloc0(
-                sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
+                sizeof(roaring_uint32_iterator_t *) * Max(nelems, 1));
 
-        KMHeapNode *heap = (KMHeapNode *) palloc(sizeof(KMHeapNode) * Max(count, 1));
+        KMHeapNode *heap = (KMHeapNode *) palloc(sizeof(KMHeapNode) * Max(nelems, 1));
         int heap_size = 0;
-        int out_idx = 0;
 
         for (int i = 0; i < nelems; i++)
         {
@@ -276,14 +267,13 @@ rb_kmerge(PG_FUNCTION_ARGS)
                          errmsg("bitmap format is error")));
 
             roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
-            iters[out_idx] = it;
+            iters[i] = it;
             if (it->has_value)
             {
-                heap[heap_size].src = out_idx;
+                heap[heap_size].src = i;
                 heap[heap_size].value = it->current_value;
                 heap_size++;
             }
-            out_idx++;
         }
         if (heap_size > 1)
             km_heap_build(heap, heap_size);
@@ -340,7 +330,7 @@ rb_kmerge(PG_FUNCTION_ARGS)
         }
 
         /* Clean up iterators and heap */
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < nelems; i++)
         {
             if (iters[i])
                 roaring_uint32_iterator_free(iters[i]);
