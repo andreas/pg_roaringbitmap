@@ -111,13 +111,46 @@ Datum rb_kmerge(PG_FUNCTION_ARGS);
  *   sources int[]         – 1-based indices of input bitmaps
  *   members roaringbitmap – all elements sharing that source-set
  *
- * Uses PostgreSQL's lib/simplehash.h for the hash table and
- * lib/binaryheap.h for the k-way merge heap.
+ * Uses PostgreSQL's lib/simplehash.h for the hash table and a hand-rolled
+ * min-heap for the k-way merge.
  */
 
-#include "lib/binaryheap.h"
-
 #define KM_MAX_WORDS 16  /* supports up to 1024 inputs */
+
+/* --- Min-heap for k-way merge --- */
+
+typedef struct KMHeapNode
+{
+    int     src;    /* 0-based index of iterator */
+    uint32  value;  /* iterator's current value */
+} KMHeapNode;
+
+static inline void
+km_heap_sift_down(KMHeapNode *heap, int size, int idx)
+{
+    for (;;)
+    {
+        int left = (idx << 1) + 1;
+        if (left >= size) break;
+        int right = left + 1;
+        int smallest = left;
+        if (right < size && heap[right].value < heap[left].value)
+            smallest = right;
+        if (!(heap[smallest].value < heap[idx].value))
+            break;
+        KMHeapNode tmp = heap[idx];
+        heap[idx] = heap[smallest];
+        heap[smallest] = tmp;
+        idx = smallest;
+    }
+}
+
+static inline void
+km_heap_build(KMHeapNode *heap, int size)
+{
+    for (int i = (size >> 1) - 1; i >= 0; i--)
+        km_heap_sift_down(heap, size, i);
+}
 
 /* --- Source-set key: variable-width bitmask in a fixed-max struct --- */
 
@@ -173,20 +206,6 @@ typedef struct KMGroupEntry
 #define SH_DECLARE
 #define SH_DEFINE
 #include "lib/simplehash.h"
-
-/* --- Binary-heap comparator: min-heap by iterator current_value --- */
-
-static int
-km_heap_cmp(Datum a, Datum b, void *arg)
-{
-    roaring_uint32_iterator_t **iters = (roaring_uint32_iterator_t **) arg;
-    uint32 va = iters[DatumGetInt32(a)]->current_value;
-    uint32 vb = iters[DatumGetInt32(b)]->current_value;
-    /* Reversed comparison gives a min-heap with binaryheap's max-heap API */
-    if (va < vb) return  1;
-    if (va > vb) return -1;
-    return 0;
-}
 
 /* --- SRF state: hash table + iterator --- */
 
@@ -244,8 +263,8 @@ rb_kmerge(PG_FUNCTION_ARGS)
             (roaring_uint32_iterator_t **) palloc0(
                 sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
 
-        binaryheap *heap = binaryheap_allocate(Max(count, 1),
-                                               km_heap_cmp, iters);
+        KMHeapNode *heap = (KMHeapNode *) palloc(sizeof(KMHeapNode) * Max(count, 1));
+        int heap_size = 0;
         int out_idx = 0;
 
         for (int i = 0; i < nelems; i++)
@@ -264,10 +283,15 @@ rb_kmerge(PG_FUNCTION_ARGS)
             roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
             iters[out_idx] = it;
             if (it->has_value)
-                binaryheap_add_unordered(heap, Int32GetDatum(out_idx));
+            {
+                heap[heap_size].src = out_idx;
+                heap[heap_size].value = it->current_value;
+                heap_size++;
+            }
             out_idx++;
         }
-        binaryheap_build(heap);
+        if (heap_size > 1)
+            km_heap_build(heap, heap_size);
 
         /* Set up hash table for grouping by source-set */
         KMGroupPrivate *priv =
@@ -280,28 +304,33 @@ rb_kmerge(PG_FUNCTION_ARGS)
         KMGroupKey bitmask;
         memset(&bitmask, 0, sizeof(bitmask));
 
-        while (!binaryheap_empty(heap))
+        while (heap_size > 0)
         {
-            uint32 current_val =
-                iters[DatumGetInt32(binaryheap_first(heap))]->current_value;
+            uint32 current_val = heap[0].value;
             memset(bitmask.words, 0, nwords * sizeof(uint64));
 
             /* Collect all sources that contain current_val */
             do
             {
-                int src = DatumGetInt32(binaryheap_first(heap));
+                int src = heap[0].src;
                 bitmask.words[src / 64] |= ((uint64) 1) << (src % 64);
 
                 roaring_uint32_iterator_t *it = iters[src];
                 roaring_uint32_iterator_advance(it);
                 if (it->has_value)
-                    binaryheap_replace_first(heap, Int32GetDatum(src));
+                {
+                    heap[0].value = it->current_value;
+                    km_heap_sift_down(heap, heap_size, 0);
+                }
                 else
-                    (void) binaryheap_remove_first(heap);
+                {
+                    heap[0] = heap[heap_size - 1];
+                    heap_size--;
+                    if (heap_size > 0)
+                        km_heap_sift_down(heap, heap_size, 0);
+                }
             }
-            while (!binaryheap_empty(heap) &&
-                   iters[DatumGetInt32(binaryheap_first(heap))]->current_value
-                       == current_val);
+            while (heap_size > 0 && heap[0].value == current_val);
 
             /* Insert into the group for this source-set */
             bool found;
@@ -322,7 +351,7 @@ rb_kmerge(PG_FUNCTION_ARGS)
                 roaring_uint32_iterator_free(iters[i]);
         }
         pfree(iters);
-        binaryheap_free(heap);
+        pfree(heap);
 
         /* Store HT and prepare iterator for per-call phase */
         KMergeState *state =
