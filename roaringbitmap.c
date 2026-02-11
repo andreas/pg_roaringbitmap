@@ -114,6 +114,8 @@ PG_FUNCTION_INFO_V1(rb_kmerge_agg);
 Datum rb_kmerge_agg(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(rb_kmerge_groups);
 Datum rb_kmerge_groups(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(rb_kmerge_counts);
+Datum rb_kmerge_counts(PG_FUNCTION_ARGS);
 
 typedef struct {
     uint32 value;
@@ -1312,6 +1314,322 @@ rb_kmerge_groups(PG_FUNCTION_ARGS)
     bool nulls[2] = {false, false};
     vals[0] = PointerGetDatum(src_array);
     vals[1] = PointerGetDatum(serialized);
+
+    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+}
+
+/* ============================================================
+ * rb_kmerge_counts: count elements per source-set pattern
+ * ============================================================
+ *
+ * Like rb_kmerge_groups, but only tracks the count of elements per
+ * unique source-set instead of accumulating a full bitmap.
+ * Returns TABLE (sources int[], count bigint).
+ */
+
+/*
+ * Count-only hash table: each slot is:
+ *   uint64 words[nwords]  -- source-set bitmask (all-zero = empty)
+ *   int64  count           -- number of elements with this source-set
+ */
+typedef struct {
+    char *data;
+    int capacity;
+    int count;           /* occupied slots */
+    int nwords;
+    Size stride;
+} KMCountHT;
+
+static inline uint64 *
+kmc_slot_words(KMCountHT *ht, int idx)
+{
+    return (uint64 *) (ht->data + (Size) idx * ht->stride);
+}
+
+static inline int64 *
+kmc_slot_count_ptr(KMCountHT *ht, int idx)
+{
+    return (int64 *) (ht->data + (Size) idx * ht->stride
+                      + ht->nwords * sizeof(uint64));
+}
+
+static inline bool
+kmc_slot_empty(KMCountHT *ht, int idx)
+{
+    uint64 *w = kmc_slot_words(ht, idx);
+    for (int i = 0; i < ht->nwords; i++) {
+        if (w[i] != 0) return false;
+    }
+    return true;
+}
+
+static void
+kmc_ht_init(KMCountHT *ht, int nwords, int init_cap)
+{
+    ht->nwords = nwords;
+    ht->stride = nwords * sizeof(uint64) + sizeof(int64);
+    ht->capacity = init_cap;
+    ht->count = 0;
+    ht->data = (char *) palloc0((Size) init_cap * ht->stride);
+}
+
+static void
+kmc_ht_resize(KMCountHT *ht)
+{
+    int old_cap = ht->capacity;
+    char *old_data = ht->data;
+    Size old_stride = ht->stride;
+    int new_cap = old_cap * 2;
+    int new_mask = new_cap - 1;
+
+    ht->data = (char *) palloc0((Size) new_cap * ht->stride);
+    ht->capacity = new_cap;
+
+    for (int i = 0; i < old_cap; i++) {
+        uint64 *w = (uint64 *) (old_data + (Size) i * old_stride);
+        bool occupied = false;
+        for (int j = 0; j < ht->nwords; j++) {
+            if (w[j] != 0) { occupied = true; break; }
+        }
+        if (!occupied) continue;
+
+        int64 cnt = *(int64 *) (old_data + (Size) i * old_stride
+                                + ht->nwords * sizeof(uint64));
+        uint32 h = kmg_hash(w, ht->nwords);
+        int idx = h & new_mask;
+        while (!kmc_slot_empty(ht, idx))
+            idx = (idx + 1) & new_mask;
+        memcpy(kmc_slot_words(ht, idx), w, ht->nwords * sizeof(uint64));
+        *kmc_slot_count_ptr(ht, idx) = cnt;
+    }
+
+    pfree(old_data);
+}
+
+/* Returns pointer to the count for this bitmask, creating if needed */
+static int64 *
+kmc_ht_get_or_create(KMCountHT *ht, const uint64 *bitmask)
+{
+    int mask, idx;
+    uint32 h;
+
+    if (ht->count * 2 >= ht->capacity)
+        kmc_ht_resize(ht);
+
+    mask = ht->capacity - 1;
+    h = kmg_hash(bitmask, ht->nwords);
+    idx = h & mask;
+
+    while (!kmc_slot_empty(ht, idx)) {
+        if (kmg_words_equal(kmc_slot_words(ht, idx), bitmask, ht->nwords))
+            return kmc_slot_count_ptr(ht, idx);
+        idx = (idx + 1) & mask;
+    }
+
+    memcpy(kmc_slot_words(ht, idx), bitmask, ht->nwords * sizeof(uint64));
+    *kmc_slot_count_ptr(ht, idx) = 0;
+    ht->count++;
+    return kmc_slot_count_ptr(ht, idx);
+}
+
+typedef struct {
+    uint64 *words;
+    int64 count;
+} KMCountResult;
+
+typedef struct {
+    int n_results;
+    int current_result;
+    int nwords;
+    KMCountResult *results;
+    TupleDesc tupdesc;
+} KMergeCountsState;
+
+static int nwords_for_count_cmp;
+
+static int
+kmcount_cmp(const void *a, const void *b)
+{
+    const uint64 *wa = ((const KMCountResult *) a)->words;
+    const uint64 *wb = ((const KMCountResult *) b)->words;
+    for (int i = 0; i < nwords_for_count_cmp; i++) {
+        if (wa[i] < wb[i]) return -1;
+        if (wa[i] > wb[i]) return 1;
+    }
+    return 0;
+}
+
+Datum
+rb_kmerge_counts(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    MemoryContext oldcontext;
+
+    if (SRF_IS_FIRSTCALL()) {
+        ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        int16 elmlen;
+        bool elmbyval;
+        char elmalign;
+        Oid elmtype = ARR_ELEMTYPE(arr);
+        get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+
+        Datum *elem_values;
+        bool *elem_nulls;
+        int nelems;
+        deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
+                          &elem_values, &elem_nulls, &nelems);
+
+        int n_bitmaps = 0;
+        for (int i = 0; i < nelems; i++) {
+            if (!elem_nulls[i]) n_bitmaps++;
+        }
+
+        int nwords = (n_bitmaps + 63) / 64;
+        if (nwords < 1) nwords = 1;
+
+        /* Build iterators and min-heap */
+        roaring_uint32_iterator_t **iters =
+            (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(n_bitmaps, 1));
+        KMergNode *heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(n_bitmaps, 1));
+        int heap_size = 0;
+        int out_idx = 0;
+
+        for (int i = 0; i < nelems; i++) {
+            if (elem_nulls[i]) continue;
+            bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
+            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+            if (!rb)
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("bitmap format is error")));
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            iters[out_idx] = it;
+            if (it->has_value) {
+                heap[heap_size].element_idx = out_idx;
+                heap[heap_size].value.has_value = true;
+                heap[heap_size].value.value = it->current_value;
+                heap_size++;
+            }
+            out_idx++;
+        }
+
+        if (heap_size > 1)
+            heap_heapify(heap, heap_size);
+
+        /* K-merge: count elements per source-set bitmask */
+        KMCountHT ht;
+        kmc_ht_init(&ht, nwords, KMGROUPS_HT_INIT_CAP);
+
+        uint64 *bitmask_buf = (uint64 *) palloc0(nwords * sizeof(uint64));
+
+        while (heap_size > 0) {
+            uint32 current_val = heap[0].value.value;
+            memset(bitmask_buf, 0, nwords * sizeof(uint64));
+
+            do {
+                int src = heap[0].element_idx;
+                bitmask_buf[src / 64] |= ((uint64) 1) << (src % 64);
+
+                roaring_uint32_iterator_t *it = iters[src];
+                roaring_uint32_iterator_advance(it);
+                if (it->has_value) {
+                    heap[0].value.value = it->current_value;
+                    heap_sift_down(heap, heap_size, 0);
+                } else {
+                    heap[0] = heap[heap_size - 1];
+                    heap_size--;
+                    if (heap_size > 0)
+                        heap_sift_down(heap, heap_size, 0);
+                }
+            } while (heap_size > 0 && heap[0].value.value == current_val);
+
+            int64 *cnt = kmc_ht_get_or_create(&ht, bitmask_buf);
+            (*cnt)++;
+        }
+
+        pfree(bitmask_buf);
+
+        for (int i = 0; i < n_bitmaps; i++) {
+            if (iters[i])
+                roaring_uint32_iterator_free(iters[i]);
+        }
+        pfree(iters);
+        pfree(heap);
+
+        /* Collect results */
+        KMergeCountsState *state = (KMergeCountsState *) palloc0(sizeof(KMergeCountsState));
+        state->n_results = ht.count;
+        state->current_result = 0;
+        state->nwords = nwords;
+        state->results = (KMCountResult *) palloc(sizeof(KMCountResult) * Max(ht.count, 1));
+
+        int ridx = 0;
+        for (int i = 0; i < ht.capacity; i++) {
+            if (!kmc_slot_empty(&ht, i)) {
+                state->results[ridx].words = (uint64 *) palloc(nwords * sizeof(uint64));
+                memcpy(state->results[ridx].words, kmc_slot_words(&ht, i),
+                       nwords * sizeof(uint64));
+                state->results[ridx].count = *kmc_slot_count_ptr(&ht, i);
+                ridx++;
+            }
+        }
+        pfree(ht.data);
+
+        nwords_for_count_cmp = nwords;
+        qsort(state->results, state->n_results, sizeof(KMCountResult), kmcount_cmp);
+
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("return type must be a row type")));
+        BlessTupleDesc(tupdesc);
+        state->tupdesc = tupdesc;
+
+        funcctx->user_fctx = state;
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    KMergeCountsState *state = (KMergeCountsState *) funcctx->user_fctx;
+
+    if (state->current_result >= state->n_results)
+        SRF_RETURN_DONE(funcctx);
+
+    int idx = state->current_result++;
+    uint64 *words = state->results[idx].words;
+    int64 cnt = state->results[idx].count;
+    int nwords = state->nwords;
+
+    /* Convert bitmask words to int[] of 1-based source indices */
+    int nsources = 0;
+    for (int w = 0; w < nwords; w++) {
+        uint64 v = words[w];
+        while (v) { nsources++; v &= v - 1; }
+    }
+
+    Datum *src_datums = (Datum *) palloc(sizeof(Datum) * nsources);
+    int sidx = 0;
+    for (int w = 0; w < nwords; w++) {
+        uint64 v = words[w];
+        int base = w * 64;
+        while (v) {
+            int bit = __builtin_ctzll(v);
+            src_datums[sidx++] = Int32GetDatum(base + bit + 1);
+            v &= v - 1;
+        }
+    }
+    ArrayType *src_array = construct_array(src_datums, nsources, INT4OID,
+                                           sizeof(int32), true, 'i');
+
+    Datum vals[2];
+    bool nulls[2] = {false, false};
+    vals[0] = PointerGetDatum(src_array);
+    vals[1] = Int64GetDatum(cnt);
 
     HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
     SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));

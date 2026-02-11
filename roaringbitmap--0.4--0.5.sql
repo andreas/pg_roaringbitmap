@@ -51,3 +51,8 @@ CREATE OR REPLACE FUNCTION rb_kmerge_groups(bitmaps roaringbitmap[])
   AS 'MODULE_PATHNAME', 'rb_kmerge_groups'
   LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
+CREATE OR REPLACE FUNCTION rb_kmerge_counts(bitmaps roaringbitmap[])
+  RETURNS TABLE (sources int[], count bigint)
+  AS 'MODULE_PATHNAME', 'rb_kmerge_counts'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+

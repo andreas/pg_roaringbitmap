@@ -918,3 +918,70 @@ select count(*), (select count(distinct sources::text) from rb_kmerge_groups(
 select count(*) from rb_kmerge_groups(
   (select array_agg(rb_build(ARRAY[i]) order by i) from generate_series(1, 65) i)
 );
+
+-- ============================================================
+-- rb_kmerge_counts tests
+-- ============================================================
+
+-- Basic: same data as rb_kmerge_groups, but counts instead of bitmaps
+select * from rb_kmerge_counts(ARRAY[
+  rb_build(ARRAY[1,3,5]),
+  rb_build(ARRAY[3,4]),
+  rb_build(ARRAY[10,5])
+]);
+
+-- Grouping: many elements share the same source-set
+select * from rb_kmerge_counts(ARRAY[
+  rb_build(ARRAY[1,2,3,4,5]),
+  rb_build(ARRAY[1,2,3])
+]);
+
+-- All elements in all bitmaps -> single group
+select * from rb_kmerge_counts(ARRAY[
+  rb_build(ARRAY[1,2,3]),
+  rb_build(ARRAY[1,2,3]),
+  rb_build(ARRAY[1,2,3])
+]);
+
+-- Empty array -> no rows
+select * from rb_kmerge_counts(ARRAY[]::roaringbitmap[]);
+
+-- All NULL bitmaps -> no rows
+select * from rb_kmerge_counts(ARRAY[NULL,NULL,NULL]::roaringbitmap[]);
+
+-- Some NULL bitmaps
+select * from rb_kmerge_counts(ARRAY[
+  rb_build(ARRAY[1,3]),
+  NULL,
+  rb_build(ARRAY[3,5])
+]);
+
+-- Single bitmap
+select * from rb_kmerge_counts(ARRAY[
+  rb_build(ARRAY[1,2,3])
+]);
+
+-- Verify counts match rb_kmerge_groups cardinalities
+select g.sources, g.count as from_counts, rb_cardinality(m.members) as from_groups
+from rb_kmerge_counts(ARRAY[
+  rb_build(ARRAY[1,2,3,4,5,6,7,8,9,10]),
+  rb_build(ARRAY[1,2,3,4,5,11,12]),
+  rb_build(ARRAY[1,2,3,13,14,15])
+]) g
+join rb_kmerge_groups(ARRAY[
+  rb_build(ARRAY[1,2,3,4,5,6,7,8,9,10]),
+  rb_build(ARRAY[1,2,3,4,5,11,12]),
+  rb_build(ARRAY[1,2,3,13,14,15])
+]) m on g.sources = m.sources
+order by g.sources::text;
+
+-- N > 64: exercise variable-width bitmask
+select * from rb_kmerge_counts(
+  (select array_agg(
+    case
+      when i = 1 then rb_build(ARRAY[1,2])
+      when i = 65 then rb_build(ARRAY[1,3])
+      else rb_build(ARRAY[1])
+    end order by i
+  ) from generate_series(1, 65) i)
+);
