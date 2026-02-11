@@ -260,7 +260,8 @@ rb_kmerge(PG_FUNCTION_ARGS)
 
             bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
             roaring_bitmap_t *rb =
-                roaring_bitmap_portable_deserialize(VARDATA(data));
+                roaring_bitmap_portable_deserialize_safe(VARDATA(data),
+                    VARSIZE(data) - VARHDRSZ);
             if (!rb)
                 ereport(ERROR,
                         (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -364,30 +365,21 @@ rb_kmerge(PG_FUNCTION_ARGS)
     if (entry == NULL)
         SRF_RETURN_DONE(funcctx);
 
-    int nwords = state->nwords;
-
-    /* Convert bitmask to int[] of 1-based source indices */
+    /* Convert bitmask to int[] of 1-based source indices (single pass) */
+    Datum src_buf[KM_MAX_WORDS * 64];
     int nsources = 0;
-    for (int w = 0; w < nwords; w++)
-    {
-        uint64 v = entry->key.words[w];
-        while (v) { nsources++; v &= v - 1; }
-    }
-
-    Datum *src_datums = (Datum *) palloc(sizeof(Datum) * nsources);
-    int sidx = 0;
-    for (int w = 0; w < nwords; w++)
+    for (int w = 0; w < KM_MAX_WORDS; w++)
     {
         uint64 v = entry->key.words[w];
         int base = w * 64;
         while (v)
         {
             int bit = __builtin_ctzll(v);
-            src_datums[sidx++] = Int32GetDatum(base + bit + 1);
+            src_buf[nsources++] = Int32GetDatum(base + bit + 1);
             v &= v - 1;
         }
     }
-    ArrayType *src_array = construct_array(src_datums, nsources, INT4OID,
+    ArrayType *src_array = construct_array(src_buf, nsources, INT4OID,
                                            sizeof(int32), true, 'i');
 
     /* Serialize the members bitmap */
