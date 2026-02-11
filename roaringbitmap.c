@@ -201,37 +201,15 @@ km_heap_cmp(Datum a, Datum b, void *arg)
     return 0;
 }
 
-/* --- SRF result types --- */
+/* --- SRF state: hash table + iterator --- */
 
 typedef struct
 {
-    KMGroupKey          key;
-    roaring_bitmap_t   *members;
-} KMGroupResult;
-
-typedef struct
-{
-    int             n_results;
-    int             current_result;
-    int             nwords;
-    KMGroupResult  *results;
-    TupleDesc       tupdesc;
+    kmgroup_hash       *ht;
+    kmgroup_iterator    iter;
+    int                 nwords;
+    TupleDesc           tupdesc;
 } KMergeState;
-
-/* qsort_arg comparator: lexicographic by bitmask words */
-static int
-kmgroup_result_cmp(const void *a, const void *b, void *arg)
-{
-    int nwords = *(int *) arg;
-    const uint64 *wa = ((const KMGroupResult *) a)->key.words;
-    const uint64 *wb = ((const KMGroupResult *) b)->key.words;
-    for (int i = 0; i < nwords; i++)
-    {
-        if (wa[i] < wb[i]) return -1;
-        if (wa[i] > wb[i]) return  1;
-    }
-    return 0;
-}
 
 Datum
 rb_kmerge(PG_FUNCTION_ARGS)
@@ -359,30 +337,12 @@ rb_kmerge(PG_FUNCTION_ARGS)
         pfree(iters);
         binaryheap_free(heap);
 
-        /* Collect results from hash table into a sortable array */
+        /* Store HT and prepare iterator for per-call phase */
         KMergeState *state =
             (KMergeState *) palloc0(sizeof(KMergeState));
+        state->ht = ht;
         state->nwords = nwords;
-        state->n_results = ht->members;
-        state->results =
-            (KMGroupResult *) palloc(sizeof(KMGroupResult)
-                                     * Max(ht->members, 1));
-
-        kmgroup_iterator iter;
-        KMGroupEntry *entry;
-        int ridx = 0;
-        kmgroup_start_iterate(ht, &iter);
-        while ((entry = kmgroup_iterate(ht, &iter)) != NULL)
-        {
-            state->results[ridx].key = entry->key;
-            state->results[ridx].members = entry->members;
-            ridx++;
-        }
-        kmgroup_destroy(ht);
-
-        /* Sort by bitmask for deterministic output order */
-        qsort_arg(state->results, state->n_results, sizeof(KMGroupResult),
-                   kmgroup_result_cmp, &state->nwords);
+        kmgroup_start_iterate(ht, &state->iter);
 
         TupleDesc tupdesc;
         if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -399,18 +359,17 @@ rb_kmerge(PG_FUNCTION_ARGS)
     funcctx = SRF_PERCALL_SETUP();
     KMergeState *state = (KMergeState *) funcctx->user_fctx;
 
-    if (state->current_result >= state->n_results)
+    KMGroupEntry *entry = kmgroup_iterate(state->ht, &state->iter);
+    if (entry == NULL)
         SRF_RETURN_DONE(funcctx);
 
-    int idx = state->current_result++;
-    KMGroupResult *res = &state->results[idx];
     int nwords = state->nwords;
 
     /* Convert bitmask to int[] of 1-based source indices */
     int nsources = 0;
     for (int w = 0; w < nwords; w++)
     {
-        uint64 v = res->key.words[w];
+        uint64 v = entry->key.words[w];
         while (v) { nsources++; v &= v - 1; }
     }
 
@@ -418,7 +377,7 @@ rb_kmerge(PG_FUNCTION_ARGS)
     int sidx = 0;
     for (int w = 0; w < nwords; w++)
     {
-        uint64 v = res->key.words[w];
+        uint64 v = entry->key.words[w];
         int base = w * 64;
         while (v)
         {
@@ -431,9 +390,9 @@ rb_kmerge(PG_FUNCTION_ARGS)
                                            sizeof(int32), true, 'i');
 
     /* Serialize the members bitmap */
-    size_t portable_size = roaring_bitmap_portable_size_in_bytes(res->members);
+    size_t portable_size = roaring_bitmap_portable_size_in_bytes(entry->members);
     bytea *serialized = (bytea *) palloc(VARHDRSZ + portable_size);
-    roaring_bitmap_portable_serialize(res->members, VARDATA(serialized));
+    roaring_bitmap_portable_serialize(entry->members, VARDATA(serialized));
     SET_VARSIZE(serialized, VARHDRSZ + portable_size);
 
     Datum vals[2];
