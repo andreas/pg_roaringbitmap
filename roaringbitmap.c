@@ -1,10 +1,5 @@
 #include "roaringbitmap.h"
 #include "utils/lsyscache.h"
-#include "fmgr.h"
-#include "funcapi.h"
-#include "utils/builtins.h"
-#include "utils/memutils.h"
-#include "catalog/pg_type.h"
 
 /* Created by ZEROMAX on 2017/3/20.*/
 
