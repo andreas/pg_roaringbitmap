@@ -3,16 +3,8 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
-#include "utils/datum.h"
-#include "utils/syscache.h"
 #include "utils/memutils.h"
-#include "catalog/pg_aggregate.h"
-#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-#include "catalog/pg_cast.h"
-#include "nodes/execnodes.h"
-#include "nodes/makefuncs.h"
-#include "nodes/primnodes.h"
 
 /* Created by ZEROMAX on 2017/3/20.*/
 
@@ -105,919 +97,42 @@ ArrayContainsNulls(ArrayType *array) {
 
 
 
-// kmerge SRFs
+// rb_kmerge SRF
 PG_FUNCTION_INFO_V1(rb_kmerge);
 Datum rb_kmerge(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(rb_kmerge_avg);
-Datum rb_kmerge_avg(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(rb_kmerge_agg);
-Datum rb_kmerge_agg(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(rb_kmerge_groups);
-Datum rb_kmerge_groups(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(rb_kmerge_counts);
-Datum rb_kmerge_counts(PG_FUNCTION_ARGS);
-
-typedef struct {
-    uint32 value;
-    bool has_value;
-} OptU32;
-
-typedef struct {
-    int element_idx; /* 0-based index of iterator */
-    OptU32 value;
-} KMergNode;
-
-typedef struct {
-    int n; /* number of iterators */
-    roaring_uint32_iterator_t **iters;
-    /* heap-based k-way merge */
-    KMergNode *heap; /* min-heap of active iterators by current value */
-    int heap_size;
-    TupleDesc tupdesc; /* cached result tuple descriptor */
-    int32 *labels; /* optional labels per iterator (for avg variant) */
-} KMergeState;
-
-/* kept for past loser-tree implementation; now unused */
-
-/* --- Min-heap helpers for k-way merge --- */
-static inline void heap_sift_down(KMergNode *heap, int size, int idx)
-{
-    for (;;) {
-        int left = (idx << 1) + 1;
-        if (left >= size) break;
-        int right = left + 1;
-        int smallest = left;
-        if (right < size && heap[right].value.value < heap[left].value.value)
-            smallest = right;
-        if (!(heap[smallest].value.value < heap[idx].value.value))
-            break;
-        KMergNode tmp = heap[idx];
-        heap[idx] = heap[smallest];
-        heap[smallest] = tmp;
-        idx = smallest;
-    }
-}
-
-static inline void heap_heapify(KMergNode *heap, int size)
-{
-    for (int i = (size >> 1) - 1; i >= 0; i--) {
-        heap_sift_down(heap, size, i);
-    }
-}
-
-static int int32_asc_cmp(const void *a, const void *b)
-{
-    int32 aa = *(const int32 *)a;
-    int32 bb = *(const int32 *)b;
-    if (aa < bb) return -1;
-    if (aa > bb) return 1;
-    return 0;
-}
-
-Datum
-rb_kmerge(PG_FUNCTION_ARGS)
-{
-    FuncCallContext *funcctx;
-    MemoryContext oldcontext;
-
-    if (SRF_IS_FIRSTCALL()) {
-        ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
-        funcctx = SRF_FIRSTCALL_INIT();
-
-        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-        int16 elmlen;
-        bool elmbyval;
-        char elmalign;
-        Oid elmtype = ARR_ELEMTYPE(arr);
-        get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
-
-        Datum *elem_values;
-        bool *elem_nulls;
-        int nelems;
-        deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
-                          &elem_values, &elem_nulls, &nelems);
-
-        int count = 0;
-        for (int i = 0; i < nelems; i++) {
-            if (!elem_nulls[i]) count++;
-        }
-
-        KMergeState *state = (KMergeState *) palloc0(sizeof(KMergeState));
-        state->n = count;
-        state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
-        state->labels = NULL;
-
-        /* Build heap of active iterators */
-        state->heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
-        int heap_size = 0;
-        int out_idx = 0;
-        for (int i = 0; i < nelems; i++) {
-            if (elem_nulls[i]) continue;
-            bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
-            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
-            if (!rb)
-                ereport(ERROR,
-                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                         errmsg("bitmap format is error")));
-            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
-            state->iters[out_idx] = it;
-            if (it->has_value) {
-                state->heap[heap_size].element_idx = out_idx;
-                state->heap[heap_size].value.has_value = true;
-                state->heap[heap_size].value.value = it->current_value;
-                heap_size++;
-            }
-            out_idx++;
-        }
-        state->heap_size = heap_size;
-        if (heap_size > 1) {
-            heap_heapify(state->heap, heap_size);
-        }
-
-        /* set up result tuple descriptor */
-        TupleDesc tupdesc;
-        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATATYPE_MISMATCH),
-                     errmsg("return type must be a row type")));
-        BlessTupleDesc(tupdesc);
-
-        state->tupdesc = tupdesc;
-        funcctx->user_fctx = state;
-
-        MemoryContextSwitchTo(oldcontext);
-    }
-
-    funcctx = SRF_PERCALL_SETUP();
-    KMergeState *state = (KMergeState *) funcctx->user_fctx;
-
-    if (state->heap_size == 0) {
-        /* cleanup */
-        for (int i = 0; i < state->n; i++) {
-            if (state->iters[i])
-                roaring_uint32_iterator_free(state->iters[i]);
-        }
-        if (state->iters) pfree(state->iters);
-        if (state->heap) pfree(state->heap);
-        pfree(state);
-        SRF_RETURN_DONE(funcctx);
-    }
-
-    /* collect all sources for the current minimum value */
-    uint32 current_val_u = state->heap[0].value.value;
-    int32 current_val = (int32) current_val_u;
-
-    /* collect indices (0-based) */
-    int32 *sources = (int32 *) palloc(sizeof(int32) * Max(state->n, 1));
-    int nsources = 0;
-
-    do {
-        /* record source (convert to 1-based later) */
-        int src = state->heap[0].element_idx;
-        sources[nsources++] = (int32) src;
-        /* advance iterator at heap root and adjust heap */
-        roaring_uint32_iterator_t *it = state->iters[src];
-        roaring_uint32_iterator_advance(it);
-        if (it->has_value) {
-            state->heap[0].value.value = it->current_value;
-            heap_sift_down(state->heap, state->heap_size, 0);
-        } else {
-            /* remove root */
-            state->heap[0] = state->heap[state->heap_size - 1];
-            state->heap_size--;
-            if (state->heap_size > 0)
-                heap_sift_down(state->heap, state->heap_size, 0);
-        }
-    } while (state->heap_size > 0 && state->heap[0].value.value == current_val_u);
-
-    /* sort and convert to 1-based */
-    qsort(sources, nsources, sizeof(int32), int32_asc_cmp);
-    for (int i = 0; i < nsources; i++) sources[i] += 1;
-
-    Datum vals[2];
-    bool nulls[2] = {false, false};
-
-    vals[0] = Int32GetDatum(current_val);
-
-    Datum *src_datums = (Datum *) palloc(sizeof(Datum) * nsources);
-    for (int i = 0; i < nsources; i++) src_datums[i] = Int32GetDatum(sources[i]);
-    ArrayType *src_array = construct_array(src_datums, nsources, INT4OID, sizeof(int32), true, 'i');
-    vals[1] = PointerGetDatum(src_array);
-
-    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
-    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
-}
-
-Datum
-rb_kmerge_avg(PG_FUNCTION_ARGS)
-{
-    FuncCallContext *funcctx;
-    MemoryContext oldcontext;
-
-    if (SRF_IS_FIRSTCALL()) {
-        ArrayType *arr_bitmaps = PG_GETARG_ARRAYTYPE_P(0);
-        ArrayType *arr_labels = PG_GETARG_ARRAYTYPE_P(1);
-        funcctx = SRF_FIRSTCALL_INIT();
-
-        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-        int16 blen; bool bbyval; char balign;
-        Oid btype = ARR_ELEMTYPE(arr_bitmaps);
-        get_typlenbyvalalign(btype, &blen, &bbyval, &balign);
-
-        int16 llen; bool lbyval; char lalign;
-        Oid ltype = ARR_ELEMTYPE(arr_labels);
-        get_typlenbyvalalign(ltype, &llen, &lbyval, &lalign);
-
-        Datum *bvals; bool *bnulls; int bnelems;
-        deconstruct_array(arr_bitmaps, btype, blen, bbyval, balign,
-                          &bvals, &bnulls, &bnelems);
-
-        Datum *lvals; bool *lnulls; int lnelems;
-        deconstruct_array(arr_labels, ltype, llen, lbyval, lalign,
-                          &lvals, &lnulls, &lnelems);
-
-        if (lnelems != bnelems)
-            ereport(ERROR,
-                    (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
-                     errmsg("labels array length must match bitmaps array length")));
-
-        int count = 0;
-        for (int i = 0; i < bnelems; i++) {
-            if (!bnulls[i]) count++;
-        }
-
-        KMergeState *state = (KMergeState *) palloc0(sizeof(KMergeState));
-        state->n = count;
-        state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
-        state->labels = (int32 *) palloc0(sizeof(int32) * Max(count, 1));
-
-        state->heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
-        int heap_size = 0;
-        int out_idx = 0;
-        for (int i = 0; i < bnelems; i++) {
-            if (bnulls[i]) continue;
-
-            if (lnulls && lnulls[i])
-                ereport(ERROR,
-                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                         errmsg("label value must not be NULL when corresponding bitmap is non-NULL")));
-
-            bytea *data = (bytea *) DatumGetPointer(bvals[i]);
-            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
-            if (!rb)
-                ereport(ERROR,
-                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                         errmsg("bitmap format is error")));
-
-            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
-            state->iters[out_idx] = it;
-            state->labels[out_idx] = DatumGetInt32(lvals[i]);
-
-            if (it->has_value) {
-                state->heap[heap_size].element_idx = out_idx;
-                state->heap[heap_size].value.has_value = true;
-                state->heap[heap_size].value.value = it->current_value;
-                heap_size++;
-            }
-            out_idx++;
-        }
-        state->heap_size = heap_size;
-        if (heap_size > 1)
-            heap_heapify(state->heap, heap_size);
-
-        funcctx->user_fctx = state;
-        MemoryContextSwitchTo(oldcontext);
-    }
-
-    funcctx = SRF_PERCALL_SETUP();
-    KMergeState *state = (KMergeState *) funcctx->user_fctx;
-
-    if (state->heap_size == 0) {
-        for (int i = 0; i < state->n; i++) {
-            if (state->iters[i])
-                roaring_uint32_iterator_free(state->iters[i]);
-        }
-        if (state->iters) pfree(state->iters);
-        if (state->labels) pfree(state->labels);
-        if (state->heap) pfree(state->heap);
-        pfree(state);
-        SRF_RETURN_DONE(funcctx);
-    }
-
-    uint32 current_val_u = state->heap[0].value.value;
-
-    double sum = 0.0;
-    int cnt = 0;
-
-    do {
-        int src = state->heap[0].element_idx;
-        sum += (double) state->labels[src];
-        cnt++;
-        roaring_uint32_iterator_t *it = state->iters[src];
-        roaring_uint32_iterator_advance(it);
-        if (it->has_value) {
-            state->heap[0].value.value = it->current_value;
-            heap_sift_down(state->heap, state->heap_size, 0);
-        } else {
-            state->heap[0] = state->heap[state->heap_size - 1];
-            state->heap_size--;
-            if (state->heap_size > 0)
-                heap_sift_down(state->heap, state->heap_size, 0);
-        }
-    } while (state->heap_size > 0 && state->heap[0].value.value == current_val_u);
-
-    double avg = cnt > 0 ? (sum / (double) cnt) : 0.0;
-
-    SRF_RETURN_NEXT(funcctx, Float8GetDatum(avg));
-}
-
-/*
- * rb_kmerge_agg(bitmaps roaringbitmap[], labels anyarray, agg regprocedure, resulttype anycompatible)
- * Returns TABLE(element int, agg_value anycompatible)
- *
- * For each element present across the k input bitmaps, collect the labels
- * from all bitmaps containing that element and compute the aggregation using
- * the provided aggregate (resolved via pg_aggregate). The aggregate must be a
- * normal one-argument aggregate (no ordered-set, no moving-aggregate extras).
- */
-typedef struct {
-    int n;
-    roaring_uint32_iterator_t **iters;
-    KMergNode *heap;
-    int heap_size;
-
-    /* labels (one per iterator, corresponding to non-NULL bitmap entries) */
-    Datum *labels;
-    Oid label_elem_type;
-
-    /* type layout for labels->input conversion */
-    int16 label_typlen;
-    bool label_typbyval;
-    char label_typalign;
-    int16 input_typlen;
-    bool input_typbyval;
-    char input_typalign;
-
-    /* aggregate resolution */
-    Oid agg_oid;              /* pg_proc OID of aggregate function */
-    Oid trans_type;           /* aggtranstype */
-    int16 trans_typlen;       /* transtype length for datumCopy */
-    bool trans_typbyval;      /* transtype pass-by-value for datumCopy */
-    Oid input_type;           /* aggregate input argument type */
-    Oid finalfn_oid;          /* optional */
-    FmgrInfo transfn;
-    FmgrInfo finalfn;         /* valid only if finalfn_oid != InvalidOid */
-    bool has_finalfn;
-    bool transfn_strict;      /* true if transfn is strict */
-
-    /* init transition value, if specified */
-    Datum init_trans_value;
-    bool init_trans_isnull;
-
-    /* IO helpers for label->input and (final)->result conversions */
-    Oid label_out_func;
-    Oid input_in_func;
-    Oid input_in_ioparam;
-
-    /* cast resolution for label->input */
-    char label_cast_method;   /* 'b' binary, 'f' function, 'i' io, or 0 if same */
-    FmgrInfo label_cast_fn;   /* valid iff label_cast_method == 'f' */
-
-    Oid agg_result_type;      /* prorettype of aggregate function */
-    Oid agg_result_out_func;
-    Oid result_in_func;       /* for requested anycompatible result type */
-    Oid result_in_ioparam;
-
-    /* cast resolution for agg_result -> requested result */
-    char result_cast_method;  /* 'b', 'f', 'i', or 0 if same */
-    FmgrInfo result_cast_fn;  /* valid iff result_cast_method == 'f' */
-
-    Oid result_type;          /* resolved anycompatible */
-
-    MemoryContext pergroup_ctx;
-
-    /* Fake AggState for AggCheckCallContext support (internal transtype aggs) */
-    AggState *fake_aggstate;
-    ExprContext *fake_aggcontext;
-} KMergeAggState;
-
-static Datum
-rb_coerce_datum_via_io(Datum value, Oid from_out_func, Oid to_in_func, Oid to_in_ioparam)
-{
-    char *tmp = OidOutputFunctionCall(from_out_func, value);
-    Datum res = OidInputFunctionCall(to_in_func, tmp, to_in_ioparam, -1);
-    pfree(tmp);
-    return res;
-}
-
-/*
- * Apply a resolved cast to a datum.
- * cast_method: 0 = same type, 'b' = binary compatible, 'f' = function, 'i' = IO
- */
-static Datum
-rb_apply_cast(Datum value, char cast_method, FmgrInfo *cast_fn,
-              Oid from_out_func, Oid to_in_func, Oid to_in_ioparam)
-{
-    switch (cast_method) {
-        case 0:   /* same type */
-        case 'b': /* binary compatible */
-            return value;
-        case 'f': /* cast function */
-            return FunctionCall1(cast_fn, value);
-        case 'i': /* IO conversion */
-        default:
-            return rb_coerce_datum_via_io(value, from_out_func, to_in_func, to_in_ioparam);
-    }
-}
-
-/* resolve cast method between two types via pg_cast; returns method char or 0 if same */
-static char
-rb_resolve_cast_method(Oid fromtype, Oid totype, Oid *funcOid)
-{
-    if (fromtype == totype) {
-        if (funcOid) *funcOid = InvalidOid;
-        return 0; /* same type */
-    }
-
-    HeapTuple tup = SearchSysCache2(CASTSOURCETARGET,
-                                    ObjectIdGetDatum(fromtype),
-                                    ObjectIdGetDatum(totype));
-    if (!HeapTupleIsValid(tup)) {
-        if (funcOid) *funcOid = InvalidOid;
-        return 'i'; /* fallback to IO if no explicit cast */
-    }
-    Form_pg_cast castForm = (Form_pg_cast) GETSTRUCT(tup);
-    char method = castForm->castmethod; /* 'b', 'f', or 'i' */
-    if (funcOid) *funcOid = castForm->castfunc;
-    ReleaseSysCache(tup);
-    return method;
-}
-
-Datum
-rb_kmerge_agg(PG_FUNCTION_ARGS)
-{
-    FuncCallContext *funcctx;
-    MemoryContext oldcontext;
-
-    if (SRF_IS_FIRSTCALL()) {
-        ArrayType *arr_bitmaps = PG_GETARG_ARRAYTYPE_P(0);
-        ArrayType *arr_labels = PG_GETARG_ARRAYTYPE_P(1);
-        Oid agg_oid = PG_GETARG_OID(2);
-        funcctx = SRF_FIRSTCALL_INIT();
-
-        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-        /* Prepare bitmap array deconstruction */
-        int16 blen; bool bbyval; char balign;
-        Oid btype = ARR_ELEMTYPE(arr_bitmaps);
-        get_typlenbyvalalign(btype, &blen, &bbyval, &balign);
-
-        /* Labels array */
-        int16 llen; bool lbyval; char lalign;
-        Oid ltype = ARR_ELEMTYPE(arr_labels);
-        get_typlenbyvalalign(ltype, &llen, &lbyval, &lalign);
-
-        Datum *bvals; bool *bnulls; int bnelems;
-        deconstruct_array(arr_bitmaps, btype, blen, bbyval, balign,
-                          &bvals, &bnulls, &bnelems);
-
-        Datum *lvals; bool *lnulls; int lnelems;
-        deconstruct_array(arr_labels, ltype, llen, lbyval, lalign,
-                          &lvals, &lnulls, &lnelems);
-
-        if (lnelems != bnelems)
-            ereport(ERROR,
-                    (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
-                     errmsg("labels array length must match bitmaps array length")));
-
-        /* Build iterators for non-NULL bitmaps */
-        int count = 0;
-        for (int i = 0; i < bnelems; i++) {
-            if (!bnulls[i]) count++;
-        }
-
-        KMergeAggState *state = (KMergeAggState *) palloc0(sizeof(KMergeAggState));
-        state->n = count;
-        state->iters = (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
-        state->labels = (Datum *) palloc0(sizeof(Datum) * Max(count, 1));
-        state->label_elem_type = ltype;
-
-        state->heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
-        int heap_size = 0;
-        int out_idx = 0;
-
-        /* --- Resolve aggregate input/result types early for label coercion --- */
-        /* inspect aggregate pg_proc to get input and result types */
-        HeapTuple procTup_e = SearchSysCache1(PROCOID, ObjectIdGetDatum(agg_oid));
-        if (!HeapTupleIsValid(procTup_e))
-            ereport(ERROR,
-                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
-                     errmsg("could not find pg_proc row for aggregate %u", agg_oid)));
-        Form_pg_proc procForm_e = (Form_pg_proc) GETSTRUCT(procTup_e);
-        if (procForm_e->pronargs != 1)
-        {
-            Oid nsp = procForm_e->pronamespace;
-            char *nspname = get_namespace_name(nsp);
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-                     errmsg("aggregate %s.%s must take exactly one argument",
-                            nspname ? nspname : "", NameStr(procForm_e->proname))));
-        }
-        state->input_type = procForm_e->proargtypes.values[0];
-        state->agg_result_type = procForm_e->prorettype;
-
-        /* For polymorphic aggregates (e.g., array_agg(anynonarray)),
-         * substitute the actual type from the labels array */
-        if (IsPolymorphicType(state->input_type))
-            state->input_type = state->label_elem_type;
-
-        /* For polymorphic result types (e.g., anyarray from array_agg),
-         * we'll rely on the output column definition from RETURNS record.
-         * Set agg_result_type to the user-specified result_type later. */
-
-        ReleaseSysCache(procTup_e);
-
-        /* type layout for copy */
-        get_typlenbyvalalign(state->label_elem_type, &state->label_typlen, &state->label_typbyval, &state->label_typalign);
-        get_typlenbyvalalign(state->input_type, &state->input_typlen, &state->input_typbyval, &state->input_typalign);
-
-        /* resolve label->input cast path */
-        Oid label_cast_func = InvalidOid;
-        state->label_cast_method = rb_resolve_cast_method(state->label_elem_type, state->input_type, &label_cast_func);
-        if (state->label_cast_method == 'f')
-            fmgr_info_cxt(label_cast_func, &state->label_cast_fn, funcctx->multi_call_memory_ctx);
-
-        /* IO helpers for label->input conversion (used if cast method is 'i') */
-        {
-            bool typIsVarlena;
-            getTypeOutputInfo(state->label_elem_type, &state->label_out_func, &typIsVarlena);
-            getTypeInputInfo(state->input_type, &state->input_in_func, &state->input_in_ioparam);
-        }
-
-        for (int i = 0; i < bnelems; i++) {
-            if (bnulls[i]) continue;
-
-            if (lnulls && lnulls[i])
-                ereport(ERROR,
-                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                         errmsg("label value must not be NULL when corresponding bitmap is non-NULL")));
-
-            bytea *data = (bytea *) DatumGetPointer(bvals[i]);
-            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
-            if (!rb)
-                ereport(ERROR,
-                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                         errmsg("bitmap format is error")));
-
-            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
-            state->iters[out_idx] = it;
-            /* pre-coerce label to aggregate input type once */
-            {
-                Datum coerced = rb_apply_cast(lvals[i], state->label_cast_method,
-                                              &state->label_cast_fn,
-                                              state->label_out_func,
-                                              state->input_in_func,
-                                              state->input_in_ioparam);
-                /* copy to multi-call context lifetime */
-                state->labels[out_idx] = datumCopy(coerced, state->input_typbyval, state->input_typlen);
-            }
-
-            if (it->has_value) {
-                state->heap[heap_size].element_idx = out_idx;
-                state->heap[heap_size].value.has_value = true;
-                state->heap[heap_size].value.value = it->current_value;
-                heap_size++;
-            }
-            out_idx++;
-        }
-        state->heap_size = heap_size;
-        if (heap_size > 1)
-            heap_heapify(state->heap, heap_size);
-
-        /* resolve aggregate */
-        HeapTuple aggTup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(agg_oid));
-        if (!HeapTupleIsValid(aggTup))
-            ereport(ERROR,
-                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
-                     errmsg("could not find aggregate with OID %u", agg_oid)));
-
-        Form_pg_aggregate aggForm = (Form_pg_aggregate) GETSTRUCT(aggTup);
-        state->agg_oid = agg_oid;
-        state->trans_type = aggForm->aggtranstype;
-        state->finalfn_oid = aggForm->aggfinalfn;
-        state->has_finalfn = OidIsValid(state->finalfn_oid);
-
-        /* Get transtype layout for datumCopy */
-        get_typlenbyval(state->trans_type, &state->trans_typlen, &state->trans_typbyval);
-
-        fmgr_info_cxt(aggForm->aggtransfn, &state->transfn, funcctx->multi_call_memory_ctx);
-        state->transfn_strict = state->transfn.fn_strict;
-
-        /* For polymorphic aggregates (e.g., array_agg), the transition function
-         * calls get_fn_expr_argtype() to determine the actual input type.
-         * We need to set up fn_expr with a FuncExpr that has the resolved types.
-         */
-        {
-            FuncExpr *fexpr = makeNode(FuncExpr);
-            fexpr->funcid = aggForm->aggtransfn;
-            fexpr->funcresulttype = state->trans_type;
-            fexpr->funcretset = false;
-            fexpr->funcvariadic = false;
-            fexpr->funcformat = COERCE_EXPLICIT_CALL;
-            fexpr->funccollid = InvalidOid;
-            fexpr->inputcollid = InvalidOid;
-            fexpr->location = -1;
-            /* Build args list with Const nodes of the correct types.
-             * arg0 = trans_type (internal/state), arg1 = input_type (the actual element type) */
-            Const *arg0 = makeConst(state->trans_type, -1, InvalidOid, -1,
-                                    (Datum) 0, true, false);
-            Const *arg1 = makeConst(state->input_type, -1, InvalidOid, -1,
-                                    (Datum) 0, true, false);
-            fexpr->args = list_make2(arg0, arg1);
-            state->transfn.fn_expr = (Node *) fexpr;
-        }
-
-        if (state->has_finalfn)
-            fmgr_info_cxt(state->finalfn_oid, &state->finalfn, funcctx->multi_call_memory_ctx);
-
-        /* initval (text) -> Datum of transtype */
-        bool isnull;
-        Datum inittext = SysCacheGetAttr(AGGFNOID, aggTup, Anum_pg_aggregate_agginitval, &isnull);
-        state->init_trans_isnull = true;
-        if (!isnull) {
-            Oid in_func; Oid ioparam;
-            getTypeInputInfo(state->trans_type, &in_func, &ioparam);
-            char *cstr = TextDatumGetCString(inittext);
-            state->init_trans_value = OidInputFunctionCall(in_func, cstr, ioparam, -1);
-            state->init_trans_isnull = false;
-            pfree(cstr);
-        }
-        ReleaseSysCache(aggTup);
-
-        /* input/result types already resolved above */
-
-        /* IO helpers */
-        /* get result type from output column definition (RETURNS record) */
-        TupleDesc tupdesc;
-        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("function returning record called in context that cannot accept type record")));
-        if (tupdesc->natts != 1)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATATYPE_MISMATCH),
-                     errmsg("rb_kmerge_agg expects exactly one output column")));
-        state->result_type = TupleDescAttr(tupdesc, 0)->atttypid;
-        getTypeInputInfo(state->result_type, &state->result_in_func, &state->result_in_ioparam);
-        /* save tupdesc for building result tuples */
-        funcctx->tuple_desc = BlessTupleDesc(tupdesc);
-
-        /* For polymorphic result types (e.g., anyarray from array_agg),
-         * use the user-specified result_type */
-        if (IsPolymorphicType(state->agg_result_type))
-            state->agg_result_type = state->result_type;
-
-        /* IO helper for agg_result -> result conversion (deferred until agg_result_type is resolved) */
-        {
-            bool typIsVarlena;
-            getTypeOutputInfo(state->agg_result_type, &state->agg_result_out_func, &typIsVarlena);
-        }
-
-        /* resolve agg_result -> requested result cast once */
-        {
-            Oid res_cast_func = InvalidOid;
-            state->result_cast_method = rb_resolve_cast_method(state->agg_result_type, state->result_type, &res_cast_func);
-            if (state->result_cast_method == 'f')
-                fmgr_info_cxt(res_cast_func, &state->result_cast_fn, funcctx->multi_call_memory_ctx);
-        }
-
-        state->pergroup_ctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
-                                                    "rb_kmerge_agg pergroup",
-                                                    ALLOCSET_DEFAULT_SIZES);
-
-        /* Set up fake AggState for AggCheckCallContext support.
-         * This is needed for aggregates with internal transtype (like array_agg).
-         * We create a minimal AggState with just enough fields set for
-         * AggCheckCallContext() to work properly.
-         */
-        state->fake_aggstate = (AggState *) palloc0(sizeof(AggState));
-        state->fake_aggstate->ss.ps.type = T_AggState;  /* Make IsA(node, AggState) work */
-
-        /* Create a fake ExprContext with the memory context for aggregate state */
-        state->fake_aggcontext = (ExprContext *) palloc0(sizeof(ExprContext));
-        state->fake_aggcontext->ecxt_per_tuple_memory = state->pergroup_ctx;
-
-        /* Point curaggcontext to our fake ExprContext */
-        state->fake_aggstate->curaggcontext = state->fake_aggcontext;
-
-        funcctx->user_fctx = state;
-        MemoryContextSwitchTo(oldcontext);
-    }
-
-    funcctx = SRF_PERCALL_SETUP();
-    KMergeAggState *state = (KMergeAggState *) funcctx->user_fctx;
-
-    if (state->heap_size == 0) {
-        for (int i = 0; i < state->n; i++) {
-            if (state->iters[i])
-                roaring_uint32_iterator_free(state->iters[i]);
-        }
-        if (state->pergroup_ctx)
-            MemoryContextDelete(state->pergroup_ctx);
-        /* remaining allocations (iters, labels, heap, state) live in multi_call_memory_ctx
-         * and will be freed automatically when the SRF completes */
-        SRF_RETURN_DONE(funcctx);
-    }
-
-    /* Save original context and switch to per-group context for aggregate computation */
-    MemoryContext agg_ctx = MemoryContextSwitchTo(state->pergroup_ctx);
-
-    /* current element value */
-    uint32 current_val_u = state->heap[0].value.value;
-
-    /* aggregate across all sources matching current value */
-    /* Make a fresh copy of init value for this group to avoid modifying the original */
-    Datum trans = (Datum) 0;
-    bool trans_isnull = true;
-    if (!state->init_trans_isnull) {
-        trans = datumCopy(state->init_trans_value, state->trans_typbyval, state->trans_typlen);
-        trans_isnull = false;
-    }
-
-    do {
-        int src = state->heap[0].element_idx;
-
-        /* use pre-coerced input label */
-        Datum input_val = state->labels[src];
-
-        /* For strict transition functions with NULL trans, the first input becomes
-         * the new trans value directly (skipping the function call). This matches
-         * PostgreSQL's aggregate semantics for aggregates like min/max without initval. */
-        if (state->transfn_strict && trans_isnull) {
-            trans = datumCopy(input_val, state->input_typbyval, state->input_typlen);
-            trans_isnull = false;
-        } else {
-            LOCAL_FCINFO(fcinfo_trans, 2);
-            /* Set context to fake AggState for AggCheckCallContext support */
-            InitFunctionCallInfoData(*fcinfo_trans, &state->transfn, 2, InvalidOid,
-                                     (Node *) state->fake_aggstate, NULL);
-            fcinfo_trans->args[0].value = trans;
-            fcinfo_trans->args[0].isnull = trans_isnull;
-            fcinfo_trans->args[1].value = input_val;
-            fcinfo_trans->args[1].isnull = false;
-            Datum new_trans = FunctionCallInvoke(fcinfo_trans);
-            trans = new_trans;
-            trans_isnull = fcinfo_trans->isnull;
-        }
-
-        /* advance iterator */
-        roaring_uint32_iterator_t *it = state->iters[src];
-        roaring_uint32_iterator_advance(it);
-        if (it->has_value) {
-            state->heap[0].value.value = it->current_value;
-            heap_sift_down(state->heap, state->heap_size, 0);
-        } else {
-            state->heap[0] = state->heap[state->heap_size - 1];
-            state->heap_size--;
-            if (state->heap_size > 0)
-                heap_sift_down(state->heap, state->heap_size, 0);
-        }
-    } while (state->heap_size > 0 && state->heap[0].value.value == current_val_u);
-
-    /* finalize */
-    Datum final_val;
-    bool final_isnull;
-    if (state->has_finalfn) {
-        LOCAL_FCINFO(fcinfo_final, 1);
-        /* Set context to fake AggState for AggCheckCallContext support */
-        InitFunctionCallInfoData(*fcinfo_final, &state->finalfn, 1, InvalidOid,
-                                 (Node *) state->fake_aggstate, NULL);
-        fcinfo_final->args[0].value = trans;
-        fcinfo_final->args[0].isnull = trans_isnull;
-        final_val = FunctionCallInvoke(fcinfo_final);
-        final_isnull = fcinfo_final->isnull;
-    } else {
-        final_val = trans;
-        final_isnull = trans_isnull;
-    }
-
-    /* convert final value to requested result_type if needed, in multi-call ctx */
-    MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-    Datum out_val = (Datum) 0;
-    bool out_isnull = final_isnull;
-    if (!final_isnull) {
-        out_val = rb_apply_cast(final_val, state->result_cast_method,
-                                &state->result_cast_fn,
-                                state->agg_result_out_func,
-                                state->result_in_func,
-                                state->result_in_ioparam);
-    }
-
-    /* reset per-group allocations to avoid leaks */
-    MemoryContextReset(state->pergroup_ctx);
-
-    /* restore original context before returning */
-    MemoryContextSwitchTo(agg_ctx);
-
-    /* build result tuple */
-    Datum values[1];
-    bool nulls[1];
-    values[0] = out_val;
-    nulls[0] = out_isnull;
-    HeapTuple tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
-    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
-}
 
 /* ============================================================
- * rb_kmerge_groups: group elements by source-set pattern
+ * rb_kmerge: k-way merge with source-set grouping
  * ============================================================
  *
  * Given N bitmaps, performs a k-way merge and groups elements by which
- * combination of input bitmaps contains them. Returns one row per unique
+ * combination of input bitmaps contains them.  Returns one row per unique
  * source-set pattern with:
- *   sources int[]         - 1-based indices of input bitmaps
- *   members roaringbitmap - all elements sharing this source-set
+ *   sources int[]         – 1-based indices of input bitmaps
+ *   members roaringbitmap – all elements sharing that source-set
  *
- * The source-set is encoded as a variable-width bitmask of ceil(N/64)
- * uint64 words, so there is no upper limit on the number of inputs.
- *
- * Much more compact than rb_kmerge when many elements share the same
- * source-set (e.g. 200K employees across 33 question bitmaps -> ~200 groups).
+ * Uses PostgreSQL's lib/simplehash.h for the hash table and
+ * lib/binaryheap.h for the k-way merge heap.
  */
 
-#define KMGROUPS_HT_INIT_CAP 256
+#include "lib/binaryheap.h"
 
-/*
- * Stride-based open-addressing hash table.
- *
- * Each slot is laid out as:
- *   uint64 words[nwords]           -- the source-set bitmask (all-zero = empty)
- *   roaring_bitmap_t *members
- *   roaring_bulk_context_t bulk_ctx -- cached container for add_bulk
- *
- * Total slot size (stride) = nwords * 8 + sizeof(pointer) + sizeof(bulk_ctx).
- */
+#define KM_MAX_WORDS 16  /* supports up to 1024 inputs */
 
-typedef struct {
-    char *data;          /* flat array of stride-sized slots */
-    int capacity;        /* number of slots (power of 2) */
-    int count;           /* number of occupied slots */
-    int nwords;          /* width of bitmask in uint64 words */
-    Size stride;         /* bytes per slot */
-} KMGroupHT;
+/* --- Source-set key: variable-width bitmask in a fixed-max struct --- */
 
-/* Returned from get_or_create so callers can use add_bulk */
-typedef struct {
-    roaring_bitmap_t *members;
-    roaring_bulk_context_t *bulk_ctx;
-} KMGroupSlot;
-
-/* Access helpers for stride-based slots */
-static inline uint64 *
-kmg_slot_words(KMGroupHT *ht, int idx)
+typedef struct KMGroupKey
 {
-    return (uint64 *) (ht->data + (Size) idx * ht->stride);
-}
+    uint64 words[KM_MAX_WORDS];
+} KMGroupKey;
 
-static inline roaring_bitmap_t **
-kmg_slot_members_ptr(KMGroupHT *ht, int idx)
-{
-    return (roaring_bitmap_t **) (ht->data + (Size) idx * ht->stride
-                                  + ht->nwords * sizeof(uint64));
-}
-
-static inline roaring_bulk_context_t *
-kmg_slot_bulk_ctx(KMGroupHT *ht, int idx)
-{
-    return (roaring_bulk_context_t *) (ht->data + (Size) idx * ht->stride
-                                       + ht->nwords * sizeof(uint64)
-                                       + sizeof(roaring_bitmap_t *));
-}
-
-static inline bool
-kmg_slot_empty(KMGroupHT *ht, int idx)
-{
-    uint64 *w = kmg_slot_words(ht, idx);
-    for (int i = 0; i < ht->nwords; i++) {
-        if (w[i] != 0) return false;
-    }
-    return true;
-}
-
-static inline bool
-kmg_words_equal(const uint64 *a, const uint64 *b, int nwords)
-{
-    return memcmp(a, b, nwords * sizeof(uint64)) == 0;
-}
-
-/* Hash: XOR-fold all words with splitmix64 mixing */
+/* Hash a source-set key (only the first nwords words matter) */
 static inline uint32
-kmg_hash(const uint64 *words, int nwords)
+kmg_hash_key(const uint64 *words, int nwords)
 {
     uint64 h = 0;
-    for (int i = 0; i < nwords; i++) {
+    for (int i = 0; i < nwords; i++)
+    {
         h ^= words[i];
         h ^= h >> 30;
         h *= 0xbf58476d1ce4e5b9ULL;
@@ -1028,237 +143,246 @@ kmg_hash(const uint64 *words, int nwords)
     return (uint32) h;
 }
 
-static void
-kmg_ht_init(KMGroupHT *ht, int nwords, int init_cap)
+/* Private data threaded through the hash table for variable-width ops */
+typedef struct KMGroupPrivate
 {
-    ht->nwords = nwords;
-    ht->stride = nwords * sizeof(uint64) + sizeof(roaring_bitmap_t *)
-               + sizeof(roaring_bulk_context_t);
-    ht->capacity = init_cap;
-    ht->count = 0;
-    ht->data = (char *) palloc0((Size) init_cap * ht->stride);
-}
-
-static void
-kmg_ht_resize(KMGroupHT *ht)
-{
-    int old_cap = ht->capacity;
-    char *old_data = ht->data;
-    Size old_stride = ht->stride;
-    int new_cap = old_cap * 2;
-    int new_mask = new_cap - 1;
-
-    ht->data = (char *) palloc0((Size) new_cap * ht->stride);
-    ht->capacity = new_cap;
-
-    for (int i = 0; i < old_cap; i++) {
-        uint64 *w = (uint64 *) (old_data + (Size) i * old_stride);
-        /* check if slot occupied (any word non-zero) */
-        bool occupied = false;
-        for (int j = 0; j < ht->nwords; j++) {
-            if (w[j] != 0) { occupied = true; break; }
-        }
-        if (!occupied) continue;
-
-        roaring_bitmap_t *members = *(roaring_bitmap_t **) (old_data + (Size) i * old_stride
-                                                             + ht->nwords * sizeof(uint64));
-        uint32 h = kmg_hash(w, ht->nwords);
-        int idx = h & new_mask;
-        while (!kmg_slot_empty(ht, idx))
-            idx = (idx + 1) & new_mask;
-        memcpy(kmg_slot_words(ht, idx), w, ht->nwords * sizeof(uint64));
-        *kmg_slot_members_ptr(ht, idx) = members;
-        /* bulk_ctx is zeroed by palloc0 — it will re-cache on next add_bulk */
-    }
-
-    pfree(old_data);
-}
-
-static KMGroupSlot
-kmg_ht_get_or_create(KMGroupHT *ht, const uint64 *bitmask)
-{
-    int mask, idx;
-    uint32 h;
-    KMGroupSlot result;
-
-    if (ht->count * 2 >= ht->capacity)
-        kmg_ht_resize(ht);
-
-    mask = ht->capacity - 1;
-    h = kmg_hash(bitmask, ht->nwords);
-    idx = h & mask;
-
-    while (!kmg_slot_empty(ht, idx)) {
-        if (kmg_words_equal(kmg_slot_words(ht, idx), bitmask, ht->nwords)) {
-            result.members = *kmg_slot_members_ptr(ht, idx);
-            result.bulk_ctx = kmg_slot_bulk_ctx(ht, idx);
-            return result;
-        }
-        idx = (idx + 1) & mask;
-    }
-
-    memcpy(kmg_slot_words(ht, idx), bitmask, ht->nwords * sizeof(uint64));
-    *kmg_slot_members_ptr(ht, idx) = roaring_bitmap_create();
-    /* bulk_ctx already zeroed by palloc0 */
-    ht->count++;
-    result.members = *kmg_slot_members_ptr(ht, idx);
-    result.bulk_ctx = kmg_slot_bulk_ctx(ht, idx);
-    return result;
-}
-
-/* Result entry stored after merge for SRF iteration */
-typedef struct {
-    uint64 *words;              /* palloc'd copy, nwords uint64s */
-    roaring_bitmap_t *members;
-} KMGroupResult;
-
-typedef struct {
-    int n_results;
-    int current_result;
     int nwords;
-    KMGroupResult *results;
-    TupleDesc tupdesc;
-} KMergeGroupsState;
+} KMGroupPrivate;
 
-/* Compare two KMGroupResult by bitmask words (lexicographic, low word first) */
-static int nwords_for_cmp;  /* set before qsort call */
+/* --- simplehash element type --- */
+
+typedef struct KMGroupEntry
+{
+    KMGroupKey              key;
+    roaring_bitmap_t       *members;
+    roaring_bulk_context_t  bulk_ctx;
+    char                    status;     /* required by simplehash */
+} KMGroupEntry;
+
+/* Instantiate the hash table (declarations) */
+#define SH_PREFIX           kmgroup
+#define SH_ELEMENT_TYPE     KMGroupEntry
+#define SH_KEY_TYPE         KMGroupKey
+#define SH_KEY              key
+#define SH_HASH_KEY(tb, k)  kmg_hash_key((k).words, \
+                                ((KMGroupPrivate *) (tb)->private_data)->nwords)
+#define SH_EQUAL(tb, a, b)  (memcmp((a).words, (b).words, \
+                                ((KMGroupPrivate *) (tb)->private_data)->nwords \
+                                * sizeof(uint64)) == 0)
+#define SH_SCOPE            static inline
+#define SH_DECLARE
+#include "lib/simplehash.h"
+
+/* Instantiate the hash table (definitions) */
+#define SH_PREFIX           kmgroup
+#define SH_ELEMENT_TYPE     KMGroupEntry
+#define SH_KEY_TYPE         KMGroupKey
+#define SH_KEY              key
+#define SH_HASH_KEY(tb, k)  kmg_hash_key((k).words, \
+                                ((KMGroupPrivate *) (tb)->private_data)->nwords)
+#define SH_EQUAL(tb, a, b)  (memcmp((a).words, (b).words, \
+                                ((KMGroupPrivate *) (tb)->private_data)->nwords \
+                                * sizeof(uint64)) == 0)
+#define SH_SCOPE            static inline
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+/* --- Binary-heap comparator: min-heap by iterator current_value --- */
 
 static int
-kmgroup_cmp(const void *a, const void *b)
+km_heap_cmp(Datum a, Datum b, void *arg)
 {
-    const uint64 *wa = ((const KMGroupResult *) a)->words;
-    const uint64 *wb = ((const KMGroupResult *) b)->words;
-    for (int i = 0; i < nwords_for_cmp; i++) {
+    roaring_uint32_iterator_t **iters = (roaring_uint32_iterator_t **) arg;
+    uint32 va = iters[DatumGetInt32(a)]->current_value;
+    uint32 vb = iters[DatumGetInt32(b)]->current_value;
+    /* Reversed comparison gives a min-heap with binaryheap's max-heap API */
+    if (va < vb) return  1;
+    if (va > vb) return -1;
+    return 0;
+}
+
+/* --- SRF result types --- */
+
+typedef struct
+{
+    KMGroupKey          key;
+    roaring_bitmap_t   *members;
+} KMGroupResult;
+
+typedef struct
+{
+    int             n_results;
+    int             current_result;
+    int             nwords;
+    KMGroupResult  *results;
+    TupleDesc       tupdesc;
+} KMergeState;
+
+/* qsort_arg comparator: lexicographic by bitmask words */
+static int
+kmgroup_result_cmp(const void *a, const void *b, void *arg)
+{
+    int nwords = *(int *) arg;
+    const uint64 *wa = ((const KMGroupResult *) a)->key.words;
+    const uint64 *wb = ((const KMGroupResult *) b)->key.words;
+    for (int i = 0; i < nwords; i++)
+    {
         if (wa[i] < wb[i]) return -1;
-        if (wa[i] > wb[i]) return 1;
+        if (wa[i] > wb[i]) return  1;
     }
     return 0;
 }
 
 Datum
-rb_kmerge_groups(PG_FUNCTION_ARGS)
+rb_kmerge(PG_FUNCTION_ARGS)
 {
-    FuncCallContext *funcctx;
-    MemoryContext oldcontext;
+    FuncCallContext    *funcctx;
+    MemoryContext       oldcontext;
 
-    if (SRF_IS_FIRSTCALL()) {
-        ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
+    if (SRF_IS_FIRSTCALL())
+    {
+        ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
         funcctx = SRF_FIRSTCALL_INIT();
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-        int16 elmlen;
-        bool elmbyval;
-        char elmalign;
-        Oid elmtype = ARR_ELEMTYPE(arr);
+        /* Deconstruct input array */
+        int16   elmlen;
+        bool    elmbyval;
+        char    elmalign;
+        Oid     elmtype = ARR_ELEMTYPE(arr);
         get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
 
-        Datum *elem_values;
-        bool *elem_nulls;
-        int nelems;
+        Datum  *elem_values;
+        bool   *elem_nulls;
+        int     nelems;
         deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
                           &elem_values, &elem_nulls, &nelems);
 
+        /* Count non-NULL bitmaps */
         int count = 0;
-        for (int i = 0; i < nelems; i++) {
-            if (!elem_nulls[i]) count++;
+        for (int i = 0; i < nelems; i++)
+        {
+            if (!elem_nulls[i])
+                count++;
         }
 
         int nwords = (count + 63) / 64;
         if (nwords < 1) nwords = 1;
+        if (nwords > KM_MAX_WORDS)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("rb_kmerge supports at most %d inputs",
+                            KM_MAX_WORDS * 64)));
 
-        /* Build iterators and min-heap */
+        /* Deserialize bitmaps and create iterators */
         roaring_uint32_iterator_t **iters =
-            (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
-        KMergNode *heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(count, 1));
-        int heap_size = 0;
+            (roaring_uint32_iterator_t **) palloc0(
+                sizeof(roaring_uint32_iterator_t *) * Max(count, 1));
+
+        binaryheap *heap = binaryheap_allocate(Max(count, 1),
+                                               km_heap_cmp, iters);
         int out_idx = 0;
 
-        for (int i = 0; i < nelems; i++) {
-            if (elem_nulls[i]) continue;
+        for (int i = 0; i < nelems; i++)
+        {
+            if (elem_nulls[i])
+                continue;
+
             bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
-            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
+            roaring_bitmap_t *rb =
+                roaring_bitmap_portable_deserialize(VARDATA(data));
             if (!rb)
                 ereport(ERROR,
                         (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
                          errmsg("bitmap format is error")));
+
             roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
             iters[out_idx] = it;
-            if (it->has_value) {
-                heap[heap_size].element_idx = out_idx;
-                heap[heap_size].value.has_value = true;
-                heap[heap_size].value.value = it->current_value;
-                heap_size++;
-            }
+            if (it->has_value)
+                binaryheap_add_unordered(heap, Int32GetDatum(out_idx));
             out_idx++;
         }
+        binaryheap_build(heap);
 
-        if (heap_size > 1)
-            heap_heapify(heap, heap_size);
+        /* Set up hash table for grouping by source-set */
+        KMGroupPrivate *priv =
+            (KMGroupPrivate *) palloc(sizeof(KMGroupPrivate));
+        priv->nwords = nwords;
+        kmgroup_hash *ht = kmgroup_create(funcctx->multi_call_memory_ctx,
+                                          256, priv);
 
-        /* K-merge: group elements by source-set bitmask */
-        KMGroupHT ht;
-        kmg_ht_init(&ht, nwords, KMGROUPS_HT_INIT_CAP);
+        /* K-way merge: collect sources for each element, group in HT */
+        KMGroupKey bitmask;
+        memset(&bitmask, 0, sizeof(bitmask));
 
-        /* Scratch buffer for building bitmask each iteration */
-        uint64 *bitmask_buf = (uint64 *) palloc0(nwords * sizeof(uint64));
+        while (!binaryheap_empty(heap))
+        {
+            uint32 current_val =
+                iters[DatumGetInt32(binaryheap_first(heap))]->current_value;
+            memset(bitmask.words, 0, nwords * sizeof(uint64));
 
-        while (heap_size > 0) {
-            uint32 current_val = heap[0].value.value;
-            memset(bitmask_buf, 0, nwords * sizeof(uint64));
-
-            do {
-                int src = heap[0].element_idx;
-                bitmask_buf[src / 64] |= ((uint64) 1) << (src % 64);
+            /* Collect all sources that contain current_val */
+            do
+            {
+                int src = DatumGetInt32(binaryheap_first(heap));
+                bitmask.words[src / 64] |= ((uint64) 1) << (src % 64);
 
                 roaring_uint32_iterator_t *it = iters[src];
                 roaring_uint32_iterator_advance(it);
-                if (it->has_value) {
-                    heap[0].value.value = it->current_value;
-                    heap_sift_down(heap, heap_size, 0);
-                } else {
-                    heap[0] = heap[heap_size - 1];
-                    heap_size--;
-                    if (heap_size > 0)
-                        heap_sift_down(heap, heap_size, 0);
-                }
-            } while (heap_size > 0 && heap[0].value.value == current_val);
+                if (it->has_value)
+                    binaryheap_replace_first(heap, Int32GetDatum(src));
+                else
+                    (void) binaryheap_remove_first(heap);
+            }
+            while (!binaryheap_empty(heap) &&
+                   iters[DatumGetInt32(binaryheap_first(heap))]->current_value
+                       == current_val);
 
-            KMGroupSlot slot = kmg_ht_get_or_create(&ht, bitmask_buf);
-            roaring_bitmap_add_bulk(slot.members, slot.bulk_ctx, current_val);
+            /* Insert into the group for this source-set */
+            bool found;
+            KMGroupEntry *entry = kmgroup_insert(ht, bitmask, &found);
+            if (!found)
+            {
+                entry->members = roaring_bitmap_create();
+                memset(&entry->bulk_ctx, 0, sizeof(roaring_bulk_context_t));
+            }
+            roaring_bitmap_add_bulk(entry->members, &entry->bulk_ctx,
+                                    current_val);
         }
 
-        pfree(bitmask_buf);
-
-        /* Free iterators */
-        for (int i = 0; i < count; i++) {
+        /* Clean up iterators and heap */
+        for (int i = 0; i < count; i++)
+        {
             if (iters[i])
                 roaring_uint32_iterator_free(iters[i]);
         }
         pfree(iters);
-        pfree(heap);
+        binaryheap_free(heap);
 
-        /* Collect results from hash table */
-        KMergeGroupsState *state = (KMergeGroupsState *) palloc0(sizeof(KMergeGroupsState));
-        state->n_results = ht.count;
-        state->current_result = 0;
+        /* Collect results from hash table into a sortable array */
+        KMergeState *state =
+            (KMergeState *) palloc0(sizeof(KMergeState));
         state->nwords = nwords;
-        state->results = (KMGroupResult *) palloc(sizeof(KMGroupResult) * Max(ht.count, 1));
+        state->n_results = ht->members;
+        state->results =
+            (KMGroupResult *) palloc(sizeof(KMGroupResult)
+                                     * Max(ht->members, 1));
 
+        kmgroup_iterator iter;
+        KMGroupEntry *entry;
         int ridx = 0;
-        for (int i = 0; i < ht.capacity; i++) {
-            if (!kmg_slot_empty(&ht, i)) {
-                state->results[ridx].words = (uint64 *) palloc(nwords * sizeof(uint64));
-                memcpy(state->results[ridx].words, kmg_slot_words(&ht, i),
-                       nwords * sizeof(uint64));
-                state->results[ridx].members = *kmg_slot_members_ptr(&ht, i);
-                ridx++;
-            }
+        kmgroup_start_iterate(ht, &iter);
+        while ((entry = kmgroup_iterate(ht, &iter)) != NULL)
+        {
+            state->results[ridx].key = entry->key;
+            state->results[ridx].members = entry->members;
+            ridx++;
         }
-        pfree(ht.data);
+        kmgroup_destroy(ht);
 
-        /* Sort by bitmask (lexicographic, low word first) for deterministic output */
-        nwords_for_cmp = nwords;
-        qsort(state->results, state->n_results, sizeof(KMGroupResult), kmgroup_cmp);
+        /* Sort by bitmask for deterministic output order */
+        qsort_arg(state->results, state->n_results, sizeof(KMGroupResult),
+                   kmgroup_result_cmp, &state->nwords);
 
         TupleDesc tupdesc;
         if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -1273,29 +397,31 @@ rb_kmerge_groups(PG_FUNCTION_ARGS)
     }
 
     funcctx = SRF_PERCALL_SETUP();
-    KMergeGroupsState *state = (KMergeGroupsState *) funcctx->user_fctx;
+    KMergeState *state = (KMergeState *) funcctx->user_fctx;
 
     if (state->current_result >= state->n_results)
         SRF_RETURN_DONE(funcctx);
 
     int idx = state->current_result++;
-    uint64 *words = state->results[idx].words;
-    roaring_bitmap_t *members = state->results[idx].members;
+    KMGroupResult *res = &state->results[idx];
     int nwords = state->nwords;
 
-    /* Convert bitmask words to int[] of 1-based source indices */
+    /* Convert bitmask to int[] of 1-based source indices */
     int nsources = 0;
-    for (int w = 0; w < nwords; w++) {
-        uint64 v = words[w];
-        while (v) { nsources++; v &= v - 1; } /* popcount */
+    for (int w = 0; w < nwords; w++)
+    {
+        uint64 v = res->key.words[w];
+        while (v) { nsources++; v &= v - 1; }
     }
 
     Datum *src_datums = (Datum *) palloc(sizeof(Datum) * nsources);
     int sidx = 0;
-    for (int w = 0; w < nwords; w++) {
-        uint64 v = words[w];
+    for (int w = 0; w < nwords; w++)
+    {
+        uint64 v = res->key.words[w];
         int base = w * 64;
-        while (v) {
+        while (v)
+        {
             int bit = __builtin_ctzll(v);
             src_datums[sidx++] = Int32GetDatum(base + bit + 1);
             v &= v - 1;
@@ -1304,332 +430,16 @@ rb_kmerge_groups(PG_FUNCTION_ARGS)
     ArrayType *src_array = construct_array(src_datums, nsources, INT4OID,
                                            sizeof(int32), true, 'i');
 
-    /* Serialize members bitmap */
-    size_t portable_size = roaring_bitmap_portable_size_in_bytes(members);
+    /* Serialize the members bitmap */
+    size_t portable_size = roaring_bitmap_portable_size_in_bytes(res->members);
     bytea *serialized = (bytea *) palloc(VARHDRSZ + portable_size);
-    roaring_bitmap_portable_serialize(members, VARDATA(serialized));
+    roaring_bitmap_portable_serialize(res->members, VARDATA(serialized));
     SET_VARSIZE(serialized, VARHDRSZ + portable_size);
 
     Datum vals[2];
     bool nulls[2] = {false, false};
     vals[0] = PointerGetDatum(src_array);
     vals[1] = PointerGetDatum(serialized);
-
-    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
-    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
-}
-
-/* ============================================================
- * rb_kmerge_counts: count elements per source-set pattern
- * ============================================================
- *
- * Like rb_kmerge_groups, but only tracks the count of elements per
- * unique source-set instead of accumulating a full bitmap.
- * Returns TABLE (sources int[], count bigint).
- */
-
-/*
- * Count-only hash table: each slot is:
- *   uint64 words[nwords]  -- source-set bitmask (all-zero = empty)
- *   int64  count           -- number of elements with this source-set
- */
-typedef struct {
-    char *data;
-    int capacity;
-    int count;           /* occupied slots */
-    int nwords;
-    Size stride;
-} KMCountHT;
-
-static inline uint64 *
-kmc_slot_words(KMCountHT *ht, int idx)
-{
-    return (uint64 *) (ht->data + (Size) idx * ht->stride);
-}
-
-static inline int64 *
-kmc_slot_count_ptr(KMCountHT *ht, int idx)
-{
-    return (int64 *) (ht->data + (Size) idx * ht->stride
-                      + ht->nwords * sizeof(uint64));
-}
-
-static inline bool
-kmc_slot_empty(KMCountHT *ht, int idx)
-{
-    uint64 *w = kmc_slot_words(ht, idx);
-    for (int i = 0; i < ht->nwords; i++) {
-        if (w[i] != 0) return false;
-    }
-    return true;
-}
-
-static void
-kmc_ht_init(KMCountHT *ht, int nwords, int init_cap)
-{
-    ht->nwords = nwords;
-    ht->stride = nwords * sizeof(uint64) + sizeof(int64);
-    ht->capacity = init_cap;
-    ht->count = 0;
-    ht->data = (char *) palloc0((Size) init_cap * ht->stride);
-}
-
-static void
-kmc_ht_resize(KMCountHT *ht)
-{
-    int old_cap = ht->capacity;
-    char *old_data = ht->data;
-    Size old_stride = ht->stride;
-    int new_cap = old_cap * 2;
-    int new_mask = new_cap - 1;
-
-    ht->data = (char *) palloc0((Size) new_cap * ht->stride);
-    ht->capacity = new_cap;
-
-    for (int i = 0; i < old_cap; i++) {
-        uint64 *w = (uint64 *) (old_data + (Size) i * old_stride);
-        bool occupied = false;
-        for (int j = 0; j < ht->nwords; j++) {
-            if (w[j] != 0) { occupied = true; break; }
-        }
-        if (!occupied) continue;
-
-        int64 cnt = *(int64 *) (old_data + (Size) i * old_stride
-                                + ht->nwords * sizeof(uint64));
-        uint32 h = kmg_hash(w, ht->nwords);
-        int idx = h & new_mask;
-        while (!kmc_slot_empty(ht, idx))
-            idx = (idx + 1) & new_mask;
-        memcpy(kmc_slot_words(ht, idx), w, ht->nwords * sizeof(uint64));
-        *kmc_slot_count_ptr(ht, idx) = cnt;
-    }
-
-    pfree(old_data);
-}
-
-/* Returns pointer to the count for this bitmask, creating if needed */
-static int64 *
-kmc_ht_get_or_create(KMCountHT *ht, const uint64 *bitmask)
-{
-    int mask, idx;
-    uint32 h;
-
-    if (ht->count * 2 >= ht->capacity)
-        kmc_ht_resize(ht);
-
-    mask = ht->capacity - 1;
-    h = kmg_hash(bitmask, ht->nwords);
-    idx = h & mask;
-
-    while (!kmc_slot_empty(ht, idx)) {
-        if (kmg_words_equal(kmc_slot_words(ht, idx), bitmask, ht->nwords))
-            return kmc_slot_count_ptr(ht, idx);
-        idx = (idx + 1) & mask;
-    }
-
-    memcpy(kmc_slot_words(ht, idx), bitmask, ht->nwords * sizeof(uint64));
-    *kmc_slot_count_ptr(ht, idx) = 0;
-    ht->count++;
-    return kmc_slot_count_ptr(ht, idx);
-}
-
-typedef struct {
-    uint64 *words;
-    int64 count;
-} KMCountResult;
-
-typedef struct {
-    int n_results;
-    int current_result;
-    int nwords;
-    KMCountResult *results;
-    TupleDesc tupdesc;
-} KMergeCountsState;
-
-static int nwords_for_count_cmp;
-
-static int
-kmcount_cmp(const void *a, const void *b)
-{
-    const uint64 *wa = ((const KMCountResult *) a)->words;
-    const uint64 *wb = ((const KMCountResult *) b)->words;
-    for (int i = 0; i < nwords_for_count_cmp; i++) {
-        if (wa[i] < wb[i]) return -1;
-        if (wa[i] > wb[i]) return 1;
-    }
-    return 0;
-}
-
-Datum
-rb_kmerge_counts(PG_FUNCTION_ARGS)
-{
-    FuncCallContext *funcctx;
-    MemoryContext oldcontext;
-
-    if (SRF_IS_FIRSTCALL()) {
-        ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
-        funcctx = SRF_FIRSTCALL_INIT();
-        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-        int16 elmlen;
-        bool elmbyval;
-        char elmalign;
-        Oid elmtype = ARR_ELEMTYPE(arr);
-        get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
-
-        Datum *elem_values;
-        bool *elem_nulls;
-        int nelems;
-        deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
-                          &elem_values, &elem_nulls, &nelems);
-
-        int n_bitmaps = 0;
-        for (int i = 0; i < nelems; i++) {
-            if (!elem_nulls[i]) n_bitmaps++;
-        }
-
-        int nwords = (n_bitmaps + 63) / 64;
-        if (nwords < 1) nwords = 1;
-
-        /* Build iterators and min-heap */
-        roaring_uint32_iterator_t **iters =
-            (roaring_uint32_iterator_t **) palloc0(sizeof(roaring_uint32_iterator_t *) * Max(n_bitmaps, 1));
-        KMergNode *heap = (KMergNode *) palloc(sizeof(KMergNode) * Max(n_bitmaps, 1));
-        int heap_size = 0;
-        int out_idx = 0;
-
-        for (int i = 0; i < nelems; i++) {
-            if (elem_nulls[i]) continue;
-            bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
-            roaring_bitmap_t *rb = roaring_bitmap_portable_deserialize(VARDATA(data));
-            if (!rb)
-                ereport(ERROR,
-                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                         errmsg("bitmap format is error")));
-            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
-            iters[out_idx] = it;
-            if (it->has_value) {
-                heap[heap_size].element_idx = out_idx;
-                heap[heap_size].value.has_value = true;
-                heap[heap_size].value.value = it->current_value;
-                heap_size++;
-            }
-            out_idx++;
-        }
-
-        if (heap_size > 1)
-            heap_heapify(heap, heap_size);
-
-        /* K-merge: count elements per source-set bitmask */
-        KMCountHT ht;
-        kmc_ht_init(&ht, nwords, KMGROUPS_HT_INIT_CAP);
-
-        uint64 *bitmask_buf = (uint64 *) palloc0(nwords * sizeof(uint64));
-
-        while (heap_size > 0) {
-            uint32 current_val = heap[0].value.value;
-            memset(bitmask_buf, 0, nwords * sizeof(uint64));
-
-            do {
-                int src = heap[0].element_idx;
-                bitmask_buf[src / 64] |= ((uint64) 1) << (src % 64);
-
-                roaring_uint32_iterator_t *it = iters[src];
-                roaring_uint32_iterator_advance(it);
-                if (it->has_value) {
-                    heap[0].value.value = it->current_value;
-                    heap_sift_down(heap, heap_size, 0);
-                } else {
-                    heap[0] = heap[heap_size - 1];
-                    heap_size--;
-                    if (heap_size > 0)
-                        heap_sift_down(heap, heap_size, 0);
-                }
-            } while (heap_size > 0 && heap[0].value.value == current_val);
-
-            int64 *cnt = kmc_ht_get_or_create(&ht, bitmask_buf);
-            (*cnt)++;
-        }
-
-        pfree(bitmask_buf);
-
-        for (int i = 0; i < n_bitmaps; i++) {
-            if (iters[i])
-                roaring_uint32_iterator_free(iters[i]);
-        }
-        pfree(iters);
-        pfree(heap);
-
-        /* Collect results */
-        KMergeCountsState *state = (KMergeCountsState *) palloc0(sizeof(KMergeCountsState));
-        state->n_results = ht.count;
-        state->current_result = 0;
-        state->nwords = nwords;
-        state->results = (KMCountResult *) palloc(sizeof(KMCountResult) * Max(ht.count, 1));
-
-        int ridx = 0;
-        for (int i = 0; i < ht.capacity; i++) {
-            if (!kmc_slot_empty(&ht, i)) {
-                state->results[ridx].words = (uint64 *) palloc(nwords * sizeof(uint64));
-                memcpy(state->results[ridx].words, kmc_slot_words(&ht, i),
-                       nwords * sizeof(uint64));
-                state->results[ridx].count = *kmc_slot_count_ptr(&ht, i);
-                ridx++;
-            }
-        }
-        pfree(ht.data);
-
-        nwords_for_count_cmp = nwords;
-        qsort(state->results, state->n_results, sizeof(KMCountResult), kmcount_cmp);
-
-        TupleDesc tupdesc;
-        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATATYPE_MISMATCH),
-                     errmsg("return type must be a row type")));
-        BlessTupleDesc(tupdesc);
-        state->tupdesc = tupdesc;
-
-        funcctx->user_fctx = state;
-        MemoryContextSwitchTo(oldcontext);
-    }
-
-    funcctx = SRF_PERCALL_SETUP();
-    KMergeCountsState *state = (KMergeCountsState *) funcctx->user_fctx;
-
-    if (state->current_result >= state->n_results)
-        SRF_RETURN_DONE(funcctx);
-
-    int idx = state->current_result++;
-    uint64 *words = state->results[idx].words;
-    int64 cnt = state->results[idx].count;
-    int nwords = state->nwords;
-
-    /* Convert bitmask words to int[] of 1-based source indices */
-    int nsources = 0;
-    for (int w = 0; w < nwords; w++) {
-        uint64 v = words[w];
-        while (v) { nsources++; v &= v - 1; }
-    }
-
-    Datum *src_datums = (Datum *) palloc(sizeof(Datum) * nsources);
-    int sidx = 0;
-    for (int w = 0; w < nwords; w++) {
-        uint64 v = words[w];
-        int base = w * 64;
-        while (v) {
-            int bit = __builtin_ctzll(v);
-            src_datums[sidx++] = Int32GetDatum(base + bit + 1);
-            v &= v - 1;
-        }
-    }
-    ArrayType *src_array = construct_array(src_datums, nsources, INT4OID,
-                                           sizeof(int32), true, 'i');
-
-    Datum vals[2];
-    bool nulls[2] = {false, false};
-    vals[0] = PointerGetDatum(src_array);
-    vals[1] = Int64GetDatum(cnt);
 
     HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
     SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));

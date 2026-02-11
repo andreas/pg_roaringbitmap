@@ -243,32 +243,8 @@ CREATE OR REPLACE FUNCTION rb_iterate(roaringbitmap)
    LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
 CREATE OR REPLACE FUNCTION rb_kmerge(bitmaps roaringbitmap[])
-  RETURNS TABLE (element int, sources int[])
-  AS 'MODULE_PATHNAME', 'rb_kmerge'
-  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION rb_kmerge_avg(bitmaps roaringbitmap[], labels int[])
-  RETURNS SETOF float8
-  AS 'MODULE_PATHNAME', 'rb_kmerge_avg'
-  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION rb_kmerge_agg(
-  bitmaps roaringbitmap[],
-  labels  anyarray,
-  agg     regprocedure
-)
-  RETURNS SETOF record
-  AS 'MODULE_PATHNAME', 'rb_kmerge_agg'
-  LANGUAGE C IMMUTABLE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION rb_kmerge_groups(bitmaps roaringbitmap[])
   RETURNS TABLE (sources int[], members roaringbitmap)
-  AS 'MODULE_PATHNAME', 'rb_kmerge_groups'
-  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION rb_kmerge_counts(bitmaps roaringbitmap[])
-  RETURNS TABLE (sources int[], count bigint)
-  AS 'MODULE_PATHNAME', 'rb_kmerge_counts'
+  AS 'MODULE_PATHNAME', 'rb_kmerge'
   LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
 --

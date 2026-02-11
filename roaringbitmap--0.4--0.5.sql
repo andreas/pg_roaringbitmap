@@ -37,22 +37,6 @@ CREATE AGGREGATE rb_xor_cardinality_agg(roaringbitmap)(
 
 -- New function introduced in 0.5
 CREATE OR REPLACE FUNCTION rb_kmerge(bitmaps roaringbitmap[])
-  RETURNS TABLE (element int, sources int[])
+  RETURNS TABLE (sources int[], members roaringbitmap)
   AS 'MODULE_PATHNAME', 'rb_kmerge'
   LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION rb_kmerge_avg(bitmaps roaringbitmap[], labels int[])
-  RETURNS SETOF float8
-  AS 'MODULE_PATHNAME', 'rb_kmerge_avg'
-  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION rb_kmerge_groups(bitmaps roaringbitmap[])
-  RETURNS TABLE (sources int[], members roaringbitmap)
-  AS 'MODULE_PATHNAME', 'rb_kmerge_groups'
-  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION rb_kmerge_counts(bitmaps roaringbitmap[])
-  RETURNS TABLE (sources int[], count bigint)
-  AS 'MODULE_PATHNAME', 'rb_kmerge_counts'
-  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
-

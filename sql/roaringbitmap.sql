@@ -621,274 +621,66 @@ SELECT rb_and_cardinality('{100373,1829130,1861002,1975442,2353213,2456403}','{2
 select rb_to_array('\x3a300000010000000000000000000000000000000000000000000000000000000000000000000000000000000008'::roaringbitmap),
 rb_min('\x3a300000010000000000000000000000000000000000000000000000000000000000000000000000000000000008'::roaringbitmap);
 
-select rb_kmerge(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-]);
-
-
-select rb_kmerge_avg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[1,2,3]);
-
-
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[1,2,3], 'avg(double precision)'::regprocedure) as t(result float8);
-
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[1.5,2.5,3.5], 'avg(double precision)'::regprocedure) as t(result float8);
-
--- Test every(boolean): boolean input/output
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[true,false,true], 'every(boolean)'::regprocedure) as t(result boolean);
-
--- Test sum(integer): integer input, bigint output
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Test sum(double precision): double input/output
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[1.1,2.2,3.3], 'sum(double precision)'::regprocedure) as t(result double precision);
-
--- Test max(integer): integer input/output
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[100,200,300], 'max(integer)'::regprocedure) as t(result integer);
-
--- Test array_agg(anynonarray): integer input, integer[] output (uses internal transtype)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[10,20,30], 'array_agg(anynonarray)'::regprocedure) as t(result integer[]);
-
--- Test array_agg(anynonarray): text input, text[] output (uses internal transtype)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY['apple','banana','cherry'], 'array_agg(anynonarray)'::regprocedure) as t(result text[]);
 
 -- ============================================================
--- Edge case tests for rb_kmerge_agg
+-- rb_kmerge tests
 -- ============================================================
 
--- Edge case: Empty bitmap array - should return no rows
-select * from rb_kmerge_agg(ARRAY[]::roaringbitmap[], ARRAY[]::integer[], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: All NULL bitmaps - should return no rows (NULLs are skipped)
-select * from rb_kmerge_agg(ARRAY[NULL,NULL,NULL]::roaringbitmap[], ARRAY[1,2,3], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: Some NULL bitmaps mixed with non-NULL - NULLs skipped
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3]),
-  NULL,
-  rb_build(ARRAY[3,5])
-], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: Empty bitmaps (no bits set) - should return no rows for those
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[]::integer[]),
-  rb_build(ARRAY[1,2]),
-  rb_build(ARRAY[]::integer[])
-], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: Single bitmap
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2,3])
-], ARRAY[100], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: Single element bitmap
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[42])
-], ARRAY[999], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Error case: count doesn't have a typed variant like count(integer)
--- (PostgreSQL's count is only count(*) or count(any) which doesn't resolve to a specific OID)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[10,20,30], 'count(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: min aggregate
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY[100,200,300], 'min(integer)'::regprocedure) as t(result integer);
-
--- Edge case: Type coercion - integer labels with avg (needs double precision)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3]),
-  rb_build(ARRAY[3,5])
-], ARRAY[10,20], 'avg(double precision)'::regprocedure) as t(result float8);
-
--- Edge case: bigint labels with sum(bigint)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2]),
-  rb_build(ARRAY[2,3])
-], ARRAY[1000000000000::bigint, 2000000000000::bigint], 'sum(bigint)'::regprocedure) as t(result numeric);
-
--- Error case: string_agg takes 2 arguments (value, separator) which we don't support
--- rb_kmerge_agg only supports single-argument aggregates
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-], ARRAY['a','b','c'], 'string_agg(text,text)'::regprocedure) as t(result text);
-
--- Error case: Mismatched array lengths (more labels than bitmaps)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2])
-], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Error case: Mismatched array lengths (more bitmaps than labels)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[5,6])
-], ARRAY[10], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Error case: NULL label with non-NULL bitmap
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2]),
-  rb_build(ARRAY[3,4])
-], ARRAY[10,NULL], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Error case: Invalid aggregate OID
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2])
-], ARRAY[10], 0::regprocedure) as t(result bigint);
-
--- Error case: Function that is not an aggregate
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2])
-], ARRAY[10], 'abs(integer)'::regprocedure) as t(result integer);
-
--- Error case: Aggregate with wrong number of arguments (zero args)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2])
-], ARRAY[10], 'count(*)'::regprocedure) as t(result bigint);
-
--- Error case: Wrong output column count
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2])
-], ARRAY[10], 'sum(integer)'::regprocedure) as t(a bigint, b bigint);
-
--- Edge case: numeric type (arbitrary precision)
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2]),
-  rb_build(ARRAY[2,3])
-], ARRAY[1.23456789012345::numeric, 9.87654321098765::numeric], 'sum(numeric)'::regprocedure) as t(result numeric);
-
--- Edge case: Overlapping values in all bitmaps
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,2,3]),
-  rb_build(ARRAY[1,2,3]),
-  rb_build(ARRAY[1,2,3])
-], ARRAY[10,20,30], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: Large overlapping set
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1]),
-  rb_build(ARRAY[1]),
-  rb_build(ARRAY[1]),
-  rb_build(ARRAY[1]),
-  rb_build(ARRAY[1])
-], ARRAY[1,2,3,4,5], 'sum(integer)'::regprocedure) as t(result bigint);
-
--- Edge case: bit_or aggregate
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3]),
-  rb_build(ARRAY[3,5])
-], ARRAY[1,2], 'bit_or(integer)'::regprocedure) as t(result integer);
-
--- Edge case: bit_and aggregate
-select * from rb_kmerge_agg(ARRAY[
-  rb_build(ARRAY[1,3]),
-  rb_build(ARRAY[3,5])
-], ARRAY[3,7], 'bit_and(integer)'::regprocedure) as t(result integer);
-
--- ============================================================
--- rb_kmerge_groups tests
--- ============================================================
-
--- Basic: same data as rb_kmerge test
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+-- Basic: 3 bitmaps with partial overlaps
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[1,3,5]),
   rb_build(ARRAY[3,4]),
   rb_build(ARRAY[10,5])
 ]);
 
 -- Grouping: many elements share the same source-set
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[1,2,3,4,5]),
   rb_build(ARRAY[1,2,3])
 ]);
 
 -- Realistic: 3 question bitmaps with overlapping employee sets
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[1,2,3,4,5,6,7,8,9,10]),
   rb_build(ARRAY[1,2,3,4,5,11,12]),
   rb_build(ARRAY[1,2,3,13,14,15])
 ]);
 
 -- All elements in all bitmaps -> single group
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[1,2,3]),
   rb_build(ARRAY[1,2,3]),
   rb_build(ARRAY[1,2,3])
 ]);
 
 -- Empty array -> no rows
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[]::roaringbitmap[]);
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[]::roaringbitmap[]);
 
 -- All NULL bitmaps -> no rows
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[NULL,NULL,NULL]::roaringbitmap[]);
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[NULL,NULL,NULL]::roaringbitmap[]);
 
 -- Some NULL bitmaps (skipped, remaining get consecutive indices)
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[1,3]),
   NULL,
   rb_build(ARRAY[3,5])
 ]);
 
 -- Empty bitmaps (no bits set)
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[]::integer[]),
   rb_build(ARRAY[1,2]),
   rb_build(ARRAY[]::integer[])
 ]);
 
 -- Single bitmap
-select sources, rb_to_array(members) from rb_kmerge_groups(ARRAY[
+select sources, rb_to_array(members) from rb_kmerge(ARRAY[
   rb_build(ARRAY[1,2,3])
 ]);
 
 -- N > 64: exercise variable-width bitmask (65 inputs, requires 2 uint64 words)
 -- Build 65 bitmaps where element 1 is in all, element 2 only in bitmap 1, element 3 only in bitmap 65
-select sources, rb_to_array(members) from rb_kmerge_groups(
+select sources, rb_to_array(members) from rb_kmerge(
   (select array_agg(
     case
       when i = 1 then rb_build(ARRAY[1,2])
@@ -899,7 +691,7 @@ select sources, rb_to_array(members) from rb_kmerge_groups(
 );
 
 -- N = 100: larger than 64, element 99 only in bitmaps 1 and 100
-select sources, rb_to_array(members) from rb_kmerge_groups(
+select sources, rb_to_array(members) from rb_kmerge(
   (select array_agg(
     case
       when i = 1 then rb_build(ARRAY[42, 99])
@@ -910,78 +702,11 @@ select sources, rb_to_array(members) from rb_kmerge_groups(
 );
 
 -- N = 128: exactly 2 words boundary, all bitmaps contain element 7
-select count(*), (select count(distinct sources::text) from rb_kmerge_groups(
+select count(*), (select count(distinct sources::text) from rb_kmerge(
   (select array_agg(rb_build(ARRAY[7]) order by i) from generate_series(1, 128) i)
 )) as n_groups from generate_series(1,1);
 
 -- N = 65, disjoint: each bitmap has a unique element -> 65 groups
-select count(*) from rb_kmerge_groups(
+select count(*) from rb_kmerge(
   (select array_agg(rb_build(ARRAY[i]) order by i) from generate_series(1, 65) i)
-);
-
--- ============================================================
--- rb_kmerge_counts tests
--- ============================================================
-
--- Basic: same data as rb_kmerge_groups, but counts instead of bitmaps
-select * from rb_kmerge_counts(ARRAY[
-  rb_build(ARRAY[1,3,5]),
-  rb_build(ARRAY[3,4]),
-  rb_build(ARRAY[10,5])
-]);
-
--- Grouping: many elements share the same source-set
-select * from rb_kmerge_counts(ARRAY[
-  rb_build(ARRAY[1,2,3,4,5]),
-  rb_build(ARRAY[1,2,3])
-]);
-
--- All elements in all bitmaps -> single group
-select * from rb_kmerge_counts(ARRAY[
-  rb_build(ARRAY[1,2,3]),
-  rb_build(ARRAY[1,2,3]),
-  rb_build(ARRAY[1,2,3])
-]);
-
--- Empty array -> no rows
-select * from rb_kmerge_counts(ARRAY[]::roaringbitmap[]);
-
--- All NULL bitmaps -> no rows
-select * from rb_kmerge_counts(ARRAY[NULL,NULL,NULL]::roaringbitmap[]);
-
--- Some NULL bitmaps
-select * from rb_kmerge_counts(ARRAY[
-  rb_build(ARRAY[1,3]),
-  NULL,
-  rb_build(ARRAY[3,5])
-]);
-
--- Single bitmap
-select * from rb_kmerge_counts(ARRAY[
-  rb_build(ARRAY[1,2,3])
-]);
-
--- Verify counts match rb_kmerge_groups cardinalities
-select g.sources, g.count as from_counts, rb_cardinality(m.members) as from_groups
-from rb_kmerge_counts(ARRAY[
-  rb_build(ARRAY[1,2,3,4,5,6,7,8,9,10]),
-  rb_build(ARRAY[1,2,3,4,5,11,12]),
-  rb_build(ARRAY[1,2,3,13,14,15])
-]) g
-join rb_kmerge_groups(ARRAY[
-  rb_build(ARRAY[1,2,3,4,5,6,7,8,9,10]),
-  rb_build(ARRAY[1,2,3,4,5,11,12]),
-  rb_build(ARRAY[1,2,3,13,14,15])
-]) m on g.sources = m.sources
-order by g.sources::text;
-
--- N > 64: exercise variable-width bitmask
-select * from rb_kmerge_counts(
-  (select array_agg(
-    case
-      when i = 1 then rb_build(ARRAY[1,2])
-      when i = 65 then rb_build(ARRAY[1,3])
-      else rb_build(ARRAY[1])
-    end order by i
-  ) from generate_series(1, 65) i)
 );
