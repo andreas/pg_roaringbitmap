@@ -951,10 +951,11 @@ rb_kmerge_agg(PG_FUNCTION_ARGS)
  * Stride-based open-addressing hash table.
  *
  * Each slot is laid out as:
- *   uint64 words[nwords]     -- the source-set bitmask (all-zero = empty)
+ *   uint64 words[nwords]           -- the source-set bitmask (all-zero = empty)
  *   roaring_bitmap_t *members
+ *   roaring_bulk_context_t bulk_ctx -- cached container for add_bulk
  *
- * Total slot size (stride) = nwords * 8 + sizeof(pointer).
+ * Total slot size (stride) = nwords * 8 + sizeof(pointer) + sizeof(bulk_ctx).
  */
 
 typedef struct {
@@ -964,6 +965,12 @@ typedef struct {
     int nwords;          /* width of bitmask in uint64 words */
     Size stride;         /* bytes per slot */
 } KMGroupHT;
+
+/* Returned from get_or_create so callers can use add_bulk */
+typedef struct {
+    roaring_bitmap_t *members;
+    roaring_bulk_context_t *bulk_ctx;
+} KMGroupSlot;
 
 /* Access helpers for stride-based slots */
 static inline uint64 *
@@ -977,6 +984,14 @@ kmg_slot_members_ptr(KMGroupHT *ht, int idx)
 {
     return (roaring_bitmap_t **) (ht->data + (Size) idx * ht->stride
                                   + ht->nwords * sizeof(uint64));
+}
+
+static inline roaring_bulk_context_t *
+kmg_slot_bulk_ctx(KMGroupHT *ht, int idx)
+{
+    return (roaring_bulk_context_t *) (ht->data + (Size) idx * ht->stride
+                                       + ht->nwords * sizeof(uint64)
+                                       + sizeof(roaring_bitmap_t *));
 }
 
 static inline bool
@@ -1015,7 +1030,8 @@ static void
 kmg_ht_init(KMGroupHT *ht, int nwords, int init_cap)
 {
     ht->nwords = nwords;
-    ht->stride = nwords * sizeof(uint64) + sizeof(roaring_bitmap_t *);
+    ht->stride = nwords * sizeof(uint64) + sizeof(roaring_bitmap_t *)
+               + sizeof(roaring_bulk_context_t);
     ht->capacity = init_cap;
     ht->count = 0;
     ht->data = (char *) palloc0((Size) init_cap * ht->stride);
@@ -1050,16 +1066,18 @@ kmg_ht_resize(KMGroupHT *ht)
             idx = (idx + 1) & new_mask;
         memcpy(kmg_slot_words(ht, idx), w, ht->nwords * sizeof(uint64));
         *kmg_slot_members_ptr(ht, idx) = members;
+        /* bulk_ctx is zeroed by palloc0 — it will re-cache on next add_bulk */
     }
 
     pfree(old_data);
 }
 
-static roaring_bitmap_t *
+static KMGroupSlot
 kmg_ht_get_or_create(KMGroupHT *ht, const uint64 *bitmask)
 {
     int mask, idx;
     uint32 h;
+    KMGroupSlot result;
 
     if (ht->count * 2 >= ht->capacity)
         kmg_ht_resize(ht);
@@ -1069,15 +1087,21 @@ kmg_ht_get_or_create(KMGroupHT *ht, const uint64 *bitmask)
     idx = h & mask;
 
     while (!kmg_slot_empty(ht, idx)) {
-        if (kmg_words_equal(kmg_slot_words(ht, idx), bitmask, ht->nwords))
-            return *kmg_slot_members_ptr(ht, idx);
+        if (kmg_words_equal(kmg_slot_words(ht, idx), bitmask, ht->nwords)) {
+            result.members = *kmg_slot_members_ptr(ht, idx);
+            result.bulk_ctx = kmg_slot_bulk_ctx(ht, idx);
+            return result;
+        }
         idx = (idx + 1) & mask;
     }
 
     memcpy(kmg_slot_words(ht, idx), bitmask, ht->nwords * sizeof(uint64));
     *kmg_slot_members_ptr(ht, idx) = roaring_bitmap_create();
+    /* bulk_ctx already zeroed by palloc0 */
     ht->count++;
-    return *kmg_slot_members_ptr(ht, idx);
+    result.members = *kmg_slot_members_ptr(ht, idx);
+    result.bulk_ctx = kmg_slot_bulk_ctx(ht, idx);
+    return result;
 }
 
 /* Result entry stored after merge for SRF iteration */
@@ -1197,8 +1221,8 @@ rb_kmerge_groups(PG_FUNCTION_ARGS)
                 }
             } while (heap_size > 0 && heap[0].value.value == current_val);
 
-            roaring_bitmap_t *members = kmg_ht_get_or_create(&ht, bitmask_buf);
-            roaring_bitmap_add(members, current_val);
+            KMGroupSlot slot = kmg_ht_get_or_create(&ht, bitmask_buf);
+            roaring_bitmap_add_bulk(slot.members, slot.bulk_ctx, current_val);
         }
 
         pfree(bitmask_buf);
