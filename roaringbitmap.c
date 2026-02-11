@@ -171,19 +171,6 @@ typedef struct KMGroupEntry
                                 * sizeof(uint64)) == 0)
 #define SH_SCOPE            static inline
 #define SH_DECLARE
-#include "lib/simplehash.h"
-
-/* Instantiate the hash table (definitions) */
-#define SH_PREFIX           kmgroup
-#define SH_ELEMENT_TYPE     KMGroupEntry
-#define SH_KEY_TYPE         KMGroupKey
-#define SH_KEY              key
-#define SH_HASH_KEY(tb, k)  kmg_hash_key((k).words, \
-                                ((KMGroupPrivate *) (tb)->private_data)->nwords)
-#define SH_EQUAL(tb, a, b)  (memcmp((a).words, (b).words, \
-                                ((KMGroupPrivate *) (tb)->private_data)->nwords \
-                                * sizeof(uint64)) == 0)
-#define SH_SCOPE            static inline
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
